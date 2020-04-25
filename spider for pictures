@@ -1,0 +1,90 @@
+import re
+import requests
+import os
+from bs4 import BeautifulSoup
+
+#https://www.jianshu.com/p/4f851ba2ee9f
+# name = input('输入文件夹名称:')
+robot = 'D://utorrent//pics//'
+kv = {'user-agent': 'Mozilla/5.0'}
+
+
+# 获取url对应的源码页面
+def getHTMLText(url):
+    try:
+        r = requests.get(url, timeout=30, headers=kv)
+        r.raise_for_status()
+        r.encoding = r.apparent_encoding
+        return r.text
+    except:
+        return ''
+
+#获取所有url
+def getImgList(html):
+# 解析url源码页面
+    # 正则表达式为获取src
+    try:
+        #这里的正则表达式，src='()',这里的括号是我们需要的内容，不需要的但是对于
+	    #查找很重要的部分，我们放在括号外面。
+        #鉴于网页图片太多，想清洗比较复杂，因此用beautifulsoup对html分析，然后再re提取
+        #但是要注意，需要把center部分转化为str才可以
+        bs_temp = BeautifulSoup(html, 'html.parser')
+        html_need_to_be_re = str(bs_temp.center)
+        reg = r'src="(.+?\.jpg)"'
+        img_reg = re.compile(reg)
+        img_url = img_reg.findall(html_need_to_be_re)
+        print(img_url)# 表示在整个网页中过滤出所有图片的地址，放在imglist中
+        return img_url
+    except:
+        return''
+    
+# 下载图片
+def download(List):
+    #img_head = 'https://www.baidu.com'
+    for url_download in List:
+        print("url need to be downloaded is:", url_download)
+        try:
+            path = robot + 'zyx_new_4' + url_download.split('/')[-1]
+            print(path)
+            #url_used_actually = img_head + url_download
+            #print(url_used_actually)
+            #url = url.replace('\\', '')
+            #r = requests.get(url_used_actually, timeout=30)
+            r = requests.get(url_download)
+            print('========================')
+            print(r.status_code)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding
+            if not os.path.exists(robot):
+                os.makedirs(robot)
+            if not os.path.exists(path):
+                with open(path, 'wb') as f:
+                    f.write(r.content)
+                    f.close()
+                    print(path + ' 文件保存成功')
+            else:
+                print('文件已经存在')
+                continue
+        except:
+            continue
+
+
+def main():
+    # 初始页面url
+    url_start = 'https://www.baidu.com'
+    url_end = '.html'
+    #22个页面一起，但是要注意，网址的构成需要改
+    depth = 22
+    for i in range(1, 12, 1):
+        if i == 1:
+            url = url_start + url_end
+        else:
+            url = url_start + '_' + str(i) + url_end
+        print(url)
+        html = getHTMLText(url)
+        urls = getImgList(html)
+        print(urls)
+        download(urls)
+
+main()
+
