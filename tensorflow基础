@@ -1,0 +1,73 @@
+import tensorflow as tf
+import numpy as np
+
+trainning_step = 30000
+
+data = []
+label = []
+
+x_temp = []
+y_temp = []
+
+import matplotlib.pyplot as plt
+
+for i in range(500):
+    x = np.random.uniform(-1, 1)
+    y = np.random.uniform(0, 2)
+
+    x_temp.append(x)
+    y_temp.append(y)
+
+    if x**2 + y**2 <=1:
+        data.append([np.random.normal(x, 0.1), np.random.normal(y, 0.1)])
+        label.append(0)
+    else:
+        data.append([np.random.normal(x, 0.1), np.random.normal(y, 0.1)])
+        label.append(1)
+
+plt.scatter(x_temp, y_temp)
+plt.show()
+
+data = np.hstack(data).reshape(-1,2)
+label = np.hstack(label).reshape(-1,1)
+
+def hidden_layer(input_tensor, weight1, bias1, weight2, bias2, weight3, bias3):
+    layer1 = tf.nn.relu(tf.matmul(input_tensor, weight1) + bias1)
+    layer2 = tf.nn.relu(tf.matmul(layer1, weight2) + bias2)
+    return tf.matmul(layer2, weight3) + bias3
+
+x = tf.placeholder(tf.float32, shape = (None, 2), name = 'x-input')
+y_ = tf.placeholder(tf.float32, shape = (None, 1), name = 'y-output')
+
+weight1 = tf.Variable(tf.truncated_normal([2, 10],stddev = 0.1))
+bias1 = tf.Variable(tf.constant(0.1,shape = [10]))
+weight2 = tf.Variable(tf.truncated_normal([10, 10],stddev = 0.1))
+bias2 = tf.Variable(tf.constant(0.1,shape = [10]))
+weight3 = tf.Variable(tf.truncated_normal([10, 1],stddev = 0.1))
+bias3 = tf.Variable(tf.constant(0.1,shape = [1]))
+
+sample_size = len(data)
+
+y_pred = hidden_layer(x, weight1, bias1, weight2, bias2, weight3, bias3)
+
+error_loss = tf.reduce_sum(tf.pow(y_ - y_pred, 2))/sample_size
+
+tf.add_to_collection("losses", error_loss)
+
+regularizer = tf.contrib.layers.l2_regularizer(0.01)
+regularization = regularizer(weight1) + regularizer(weight2) + regularizer(weight3)
+
+tf.add_to_collection("losses", regularization)
+
+loss = tf.add_n(tf.get_collection("losses"))
+
+train_op = tf.train.AdamOptimizer(0.01).minimize(loss)
+
+# with tf.Session() as sess:
+#     tf.global_variables_initializer().run()
+#     for i in range(trainning_step):
+#         sess.run(train_op, feed_dict={x:data, y_:label})
+#         if i%2000 == 0:
+#             loss_value = sess.run(loss, feed_dict={x:data, y_:label})
+#             print("after %d steps, mse loss is: %f"%(i, loss_value))
+
