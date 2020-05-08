@@ -1,0 +1,33 @@
+from sklearn import datasets
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn import preprocessing
+from sklearn.cluster import AgglomerativeClustering
+
+iris = datasets.load_iris()
+iris_data = iris.data
+print(iris_data)
+
+data = np.array(iris_data[:50,1:-1])
+min_max_scaler = preprocessing.MinMaxScaler()
+data_M = min_max_scaler.fit_transform(data)
+print(data_M)
+
+from scipy.cluster.hierarchy import linkage, dendrogram
+# %matplotlib inline
+
+plt.figure(figsize=(20,6))
+Z = linkage(data_M, method='ward', metric='euclidean')
+p = dendrogram(Z, 0)
+plt.show()
+
+ac = AgglomerativeClustering(n_clusters=3, affinity='euclidean', linkage='ward')
+ac.fit(data_M)
+
+labels = ac.fit_predict(data_M)
+print(labels)
+
+plt.scatter(data_M[:,0], data_M[:,1], c=labels)
+plt.show()
+#非原创
