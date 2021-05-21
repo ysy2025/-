@@ -216,4 +216,14 @@
 		SparkEnv createDriverEnv,创建驱动环境 会调用create方法创建SparkEnv.SparkEnv构造方法
 			创建安全管理器SecurityManager
 			创建基于Akka的分布式消息系统ActorSystem
-			
+			创建Map任务输出跟踪器 MapOutputtracker
+			实例化ShuffleManager
+			创建SuffleMemoryManager
+			创建块传输服务BlockTransferService
+			创建BlockManagerMaster,块管理器老大
+			创建块管理器 BlockManager
+			创建广播管理器BroadcastManager
+			创建缓存管理器 CacheManager
+			创建HTTP文件服务器HttpFileServer
+			创建测量系统MetricsSystem
+			创建SparkEnv
