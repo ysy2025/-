@@ -227,3 +227,5 @@
 			创建HTTP文件服务器HttpFileServer
 			创建测量系统MetricsSystem
 			创建SparkEnv
+
+		2.2.1 安全管理器
