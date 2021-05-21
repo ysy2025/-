@@ -229,3 +229,154 @@
 			创建SparkEnv
 
 		2.2.1 安全管理器
+			负责权限管理,账号设置.代码和书不同了
+
+				private var secretKey: String = _
+				logInfo("SecurityManager: authentication " + (if (authOn) "enabled" else "disabled") +
+				  "; ui acls " + (if (aclsOn) "enabled" else "disabled") +
+				  "; users  with view permissions: " + viewAcls.toString() +
+				  "; groups with view permissions: " + viewAclsGroups.toString() +
+				  "; users  with modify permissions: " + modifyAcls.toString() +
+				  "; groups with modify permissions: " + modifyAclsGroups.toString())
+
+				// Set our own authenticator to properly negotiate user/password for HTTP connections.
+				// This is needed by the HTTP client fetching from the HttpServer. Put here so its
+				// only set once.
+				/*
+				用http连接设置口令认证
+				如果 autoon 为true
+					authenticcator设置默认值(新的认证器,包含了一个 get密码认证的方法,来获取passAuth,也就是获取密码)
+				*/
+				if (authOn) {
+				  Authenticator.setDefault(
+				    new Authenticator() {
+				      override def getPasswordAuthentication(): PasswordAuthentication = {
+				        var passAuth: PasswordAuthentication = null
+				        val userInfo = getRequestingURL().getUserInfo()
+				        if (userInfo != null) {
+				          val  parts = userInfo.split(":", 2)
+				          passAuth = new PasswordAuthentication(parts(0), parts(1).toCharArray())
+				        }
+				        return passAuth
+				      }
+				    }
+				  )
+				}
+
+		2.2.2 基于Akka的分布式消息系统ActorSystem
+			ActorSystem 是最基础设施.spark用它发送分布式消息,实现并发编程
+			SparkEnv 创建基于Akka的分布式消息系统ActorSystem 用到了 AkkaUtils工具类
+			但是Akka在最新的spark里面似乎被移除了.ActorSystem在后面版本会被RpcEnv替换掉 //https://blog.csdn.net/luyllyl/article/details/80406842
+			SparkEnv类中, //https://blog.csdn.net/dabokele/article/details/85706073
+			class SparkEnv (
+		    	val executorId: String,
+				private[spark] val rpcEnv: RpcEnv
+
+			1、调用栈分析
+			(1)Driver端
+			Driver端创建SparkEnv对象是在SparkContext中进行的，调用栈如下:SparkContext#createSparkEnv ----> SparkEnv.createDriverEnv --------> SparkEnv.create
+			(2)Executor端
+			Executor端创建SparkEnv对象的过程是，CoarseGrainedExecutorBackend#run ----> SparkEnv.createExecutorEnv --------> SparkEnv.create
+
+			2,RpcEnv 分析
+			Spark中Driver端和Executor端通信主要通过RpcEnv来实现。两端的RpcEnv对象创建过程在SparkEnv#create方法中已经看到过了。
+			有关Rpc的代码在org.apache.spark.rpc包中，其中还有一个名为netty的子package
+			总共涉及以下三种类
+			环境相关，主要包括RpcEnv, NettyRpcEnv,RpcEnvConfig,NettyRpcEnvFactory，
+			Server相关，主要是RpcEndpoint，ThreadSafeRpcEndpoint，
+			Client相关，代表RpcEndpoint的引用，比如RpcEndpointRef,NettyRpcEndpointRef
+
+				1、RpcEnv生成调用栈
+				生成RpcEnv对象的基本调用过程如下所示，最终是通过NettyRpcEnvFactory#create方法得到了一个NettyRpcEnv对象，NettyRpcEnv继承自RpcEnv类。
+				SparkEnv#create ----> RpcEnv#create --------> NettyRpcEnvFactory#create
+
+				RpcEnv#create 在RpcEnv中有两个create方法，该方法的实现以及在SparkEnv中的调用方式
+				/**
+				* systemName: sparkDeiver/sparkExecutor
+				* bindAddress: Driver端IP地址，或者Executor端的IP地址
+				* advertiseAddress: Driver端IP地址，或者Executor端的IP地址
+				* port: Executor端为空，Driver端启动时的端口号
+				*/
+				val rpcEnv = RpcEnv.create(systemName, bindAddress, advertiseAddress, port, conf, securityManager, clientMode = !isDriver)
+
+				// 定义
+				def create(
+				  name: String,
+				  host: String,
+				  port: Int,
+				  conf: SparkConf,
+				  securityManager: SecurityManager,
+				  clientMode: Boolean = false): RpcEnv = {
+				create(name, host, host, port, conf, securityManager, 0, clientMode)
+				}
+
+				def create(
+				  name: String,
+				  bindAddress: String,
+				  advertiseAddress: String,
+				  port: Int,
+				  conf: SparkConf,
+				  securityManager: SecurityManager,
+				  numUsableCores: Int,
+				  clientMode: Boolean): RpcEnv = {
+				val config = RpcEnvConfig(conf, name, bindAddress, advertiseAddress, port, securityManager,
+				  numUsableCores, clientMode)
+				new NettyRpcEnvFactory().create(config)
+				}
+
+		2.2.3 map任务输出跟踪器 MapOutputtracker
+			跟踪map阶段任务输出状态;方便reduce阶段获取地址和中间输出结果
+			每个map和reduce任务都有id;reduce会从不同map任务节点拉block数据,叫洗牌(shuffle);shuffle有id
+			MapOutputTracker 内部用 mapstatuses:Map[Int, Array[MapStatus]], 调用栈:MapOutputTracker->MapOutputTrackerWorker类-> value mapStatuses
+			val mapStatuses: Map[Int, Array[MapStatus]] = new ConcurrentHashMap[Int, Array[MapStatus]]().asScala
+			MapOutputTrackerWorker类内部有getstatuses方法获取mapstatuses->Array[MapStatus]
+
+			其中key对应shuffleid,array对应map任务的mapstatus
+
+			Driver端处理 MapOutputTracker 和Executor 处理方式不同
+			根据SparkEnv.scala脚本中
+				val mapOutputTracker = if (isDriver) {
+				  new MapOutputTrackerMaster(conf, broadcastManager, isLocal)
+				} else {
+				  new MapOutputTrackerWorker(conf)
+				}
+			//https://www.jianshu.com/p/3c6b4209a5f3?utm_campaign=maleskine&utm_content=note&utm_medium=seo_notes&utm_source=recommendation
+			可以看出来,if 是Driver, MapOutputTrackerMaster(conf, broadcastManager, isLocal), 调用 MapOutputTracker的 MapOutputTrackerMaster类
+			然后利用Rpc注册到RpcEnv中
+			if 是executor, MapOutputTrackerWorker
+
+			无论是driver或者executor,都由 registerOrLookupEndpoint 利用RpcEndpoint 来 传递信息
+				def registerOrLookupEndpoint(
+				    name: String, endpointCreator: => RpcEndpoint):
+				  RpcEndpointRef = {
+				  if (isDriver) {
+				    logInfo("Registering " + name)
+				    rpcEnv.setupEndpoint(name, endpointCreator)
+				  } else {
+				    RpcUtils.makeDriverRef(name, conf, rpcEnv)
+				  }
+				}
+
+		2.2.4 实例化 ShuffleManager
+			ShuffleManager 负责管理本地和远程的block数据的shuffle操作. 默认为 通过反射方式 生成 sortshufflemanager 实例 <- 通过持有的 indexshuffleblockmanager
+			间接操作 blockManager 中的 DiskBlockManager 将map写入本地 根据shuffleid mapid 写入索引id
+
+			DiskBlockManager -> BlockManager -> Indexshuffleblockmanager -> Sortshufflemanager -> ShuffleManager 层层递进
+			DiskBlockManager 负责将map结果写入本地,根据shuffleid, mapid 写入索引id 或者从 mapStatuses 从本地或者其他远程节点读取文件
+			最终ShuffleManager要化身读文件机器
+				// Let the user specify short names for shuffle managers
+			    val shortShuffleMgrNames = Map(
+				  "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
+				  "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName)
+		        val shuffleMgrName = conf.get("spark.shuffle.manager", "sort")
+				val shuffleMgrClass = shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
+				val shuffleManager = instantiateClass[ShuffleManager](shuffleMgrClass)
+			而
+			    private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager with Logging
+			    		...
+			    		private[this] val numMapsForShuffle = new ConcurrentHashMap[Int, Int]()
+  						override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
+  			至于IndexShuffleBlockResolver
+  				private[spark] class IndexShuffleBlockResolver(conf: SparkConf,_blockManager: BlockManager = null)extends ShuffleBlockResolver with Logging
+
+  			ShuffleMemoryManager 后续详谈
