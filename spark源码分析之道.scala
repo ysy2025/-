@@ -212,3 +212,8 @@
 			    listenerBus: LiveListenerBus): SparkEnv = {
 			  SparkEnv.createDriverEnv(conf, isLocal, listenerBus, SparkContext.numDriverCores(master, conf))
 			}
+
+		SparkEnv createDriverEnv,创建驱动环境 会调用create方法创建SparkEnv.SparkEnv构造方法
+			创建安全管理器SecurityManager
+			创建基于Akka的分布式消息系统ActorSystem
+			
