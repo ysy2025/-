@@ -11,7 +11,7 @@
 
 			内存的读写速度随便可以上20GB/s（50GB/s）
 			当然更快的还有CPU的那几级缓存，比如L1可以到400+GB/s的读取、200+GB/s的写入（3100+GB/s读、1600+GB/s写）。
-			链接：https://www.zhihu.com/question/33272188
+			链接:https://www.zhihu.com/question/33272188
 
 		Spark特点:
 			快速处理
@@ -82,6 +82,7 @@
 			driverapp:客户端驱动程序,将任务转成RDD和DAG,与ClusterManager通信和调度
 
 2 SparkContext初始化
+参考:https://www.yuque.com/liangjiangjiang/tm6hpg/ogaa4y
 	2.1 SparkContext概述
 		sparkcontext(以下简称sc)主要由sparkconf(以下简称scf)负责配置参数;如果sc是发动机,scf就是操作面板
 		scf的构造很简单,通过concurrenthashmap来维护属性
@@ -156,7 +157,7 @@
 			1. Some[A] 有类型A的值
 			2. None 没有值
 
-		Option一般有两种用法：
+		Option一般有两种用法:
 			1. 模式匹配
 				Option[A] option
 				option match {
@@ -379,4 +380,230 @@
   			至于IndexShuffleBlockResolver
   				private[spark] class IndexShuffleBlockResolver(conf: SparkConf,_blockManager: BlockManager = null)extends ShuffleBlockResolver with Logging
 
-  			ShuffleMemoryManager 后续详谈
+  		2.2.5 ShuffleMemoryManager
+  			线程内存管理器
+  				管理Shuffle线程占有内存的分配和释放.通过threadMemory缓存每个线程的内存字节数
+
+  			可能被 memoryManager取代了
+				val useLegacyMemoryManager = conf.getBoolean("spark.memory.useLegacyMode", false)
+				val memoryManager: MemoryManager =
+				  if (useLegacyMemoryManager) {
+				    new StaticMemoryManager(conf, numUsableCores)
+				  } else {
+				    UnifiedMemoryManager(conf, numUsableCores)
+				  }
+
+			根据useablecores,可用的cpu核数,来确定内存
+			如果 useLegacyMemoryManager:
+				StaticMemoryManager,静态内存管理器
+					StaticMemoryManager(conf: SparkConf,maxOnHeapExecutionMemory: Long,override val maxOnHeapStorageMemory: Long,numCores: Int)
+					参数分别为:
+					StaticMemoryManager(conf,StaticMemoryManager.getMaxExecutionMemory(conf),StaticMemoryManager.getMaxStorageMemory(conf),numCores)
+			如果不是 useLegacyMemoryManager:
+				UnifiedMemoryManager,统一内存管理器
+					memory.UnifiedMemoryManager
+			
+			spark.memory.StaticMemoryManager中,getMaxExecutionMemory,Java运行时最大内存*Spark的shuflle最大内存占比*Spark的安全内存占比
+
+		2.2.6 块传输服务 BlockTransferService
+		    BlockTransferService默认利用NettyBlockTransferService;以前可以配置属性使用 NioBlockTransferService;现在似乎不可以了
+			val blockTransferService =
+			  new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress,
+			    blockManagerPort, numUsableCores)
+			NettyBlockTransferService 具体实现后续再说
+
+	  	2.2.7 BlockManagerMaster 介绍
+	  		BlockManagerMaster, 负责管理协调Block;具体操作,老版本依赖于Actor系统,现在是不是RpcEnv?
+				val blockManagerMaster = new BlockManagerMaster(registerOrLookupEndpoint(
+					BlockManagerMaster.DRIVER_ENDPOINT_NAME,
+					new BlockManagerMasterEndpoint(rpcEnv, isLocal, conf, listenerBus)),
+					conf, isDriver)
+			可见,依赖于BlockManagerMasterEndpoint, 参数为rpcEnv,作为分布式消息系统传输消息
+			Driver 和Executor应对方式不同
+
+		2.2.8 创建块管理器 BlockManager
+			BlockManager 负责管理Block;只有在 BlockManager 初始化之后,才有效
+			// NB: blockManager is not valid until initialize() is called later.
+			val blockManager = new BlockManager(executorId, rpcEnv, blockManagerMaster,
+			  serializerManager, conf, memoryManager, mapOutputTracker, shuffleManager,
+			  blockTransferService, securityManager, numUsableCores)
+			参数有,executorId,执行器的id;rpcenv,分布式消息传输系统;blockmanagermaster,块管理器master
+			serializerManager,conf等参数.非常长
+			需要参考 storage.BlockManager
+
+		2.2.9 创建广播管理器 BroadcastManager
+			将配置信息和序列化后的RDD,Job,ShuffleDependency等信息,在本地存储.如果考虑容灾,也会复制到其他节点
+			首先initial,然后BroadcastManager生效.
+				initialize()
+
+				// Called by SparkContext or Executor before using Broadcast
+				private def initialize() {
+				synchronized {
+				  if (!initialized) {
+				    broadcastFactory = new TorrentBroadcastFactory
+				    broadcastFactory.initialize(isDriver, conf, securityManager)
+				    initialized = true
+				  }
+				}
+				}
+			首先initialize
+			initialize方法,利用broadcastFactory方法,而broadcastFactor实际上代理了TorrentBroadcastFactory;
+				//获取下一个广播id
+				private val nextBroadcastId = new AtomicLong(0)
+				//初始化缓存值
+				private[broadcast] val cachedValues = {
+				new ReferenceMap(AbstractReferenceMap.HARD, AbstractReferenceMap.WEAK)
+				}
+				//初始化新的广播
+				def newBroadcast[T: ClassTag](value_ : T, isLocal: Boolean): Broadcast[T] = {
+				broadcastFactory.newBroadcast[T](value_, isLocal, nextBroadcastId.getAndIncrement())
+				}
+
+		2.2.20 创建缓存管理器 CacheManager
+			缓存RDD某个分区计算后的中间结果
+			val cacheManager: CacheManager = new CacheManager
+			在spark.sql.internal.SharedState中,是分享状态
+
+		2.2.11 HTTP文件服务器 HTTPFileServer
+			spark运行时executor可能需要远程下载driver上的jar或文件到本地,对应的内部实现为:
+			父类:RpcEnvFileServer
+			子类:NettyStreamManager、HttpBasedFileServer,底层分别由netty、jetty实现
+			根据参数spark.rpc.useNettyFileServer配置
+			看来放弃了 HTTP文件服务器 HTTPFileServer
+			根据原来的脚本推测,新版本大概采用了一下方式
+				// Add a reference to tmp dir created by driver, we will delete this tmp dir when stop() is
+				// called, and we only need to do it for driver. Because driver may run as a service, and if we
+				// don't delete this tmp dir when sc is stopped, then will create too many tmp dirs.
+				if (isDriver) {
+				  val sparkFilesDir = Utils.createTempDir(Utils.getLocalDir(conf), "userFiles").getAbsolutePath
+				  envInstance.driverTmpDir = Some(sparkFilesDir)
+				}
+
+		2.2.12 创建测量系统 MetricsSystem
+			Spark的测量系统.
+				val metricsSystem = if (isDriver) {
+				  // Don't start metrics system right now for Driver.
+				  // We need to wait for the task scheduler to give us an app ID.
+				  // Then we can start the metrics system.
+				  //如果是driver,不用metrics系统;需要等task 调度器放弃一个appid;然后开启metrics系统
+				  MetricsSystem.createMetricsSystem("driver", conf, securityManager)
+				} else {
+				  // We need to set the executor ID before the MetricsSystem is created because sources and
+				  // sinks specified in the metrics configuration file will want to incorporate this executor's
+				  // ID into the metrics they report.
+				  //在metrics系统被创建之前设置执行器id.需要报道
+				  conf.set("spark.executor.id", executorId)
+				  val ms = MetricsSystem.createMetricsSystem("executor", conf, securityManager)
+				  ms.start()
+				  ms
+				}
+
+			调用的 createMetricsSystem创建了MetricsSystem
+				def createMetricsSystem(
+				  instance: String, conf: SparkConf, securityMgr: SecurityManager): MetricsSystem = {
+				new MetricsSystem(instance, conf, securityMgr)
+				}
+
+			构造MetricsSystem 过程最重要的是调用了 metricsConfig.initialize()方法
+				private[spark] class MetricsSystem private (
+				    val instance: String,
+				    conf: SparkConf,
+				    securityMgr: SecurityManager)
+				  extends Logging {
+				...
+				  metricsConfig.initialize()
+				...}
+
+			这里 initialize
+				def initialize() {
+				// Add default properties in case there's no properties file
+				// 如果没有属性,增加默认属性
+				setDefaultProperties(properties)
+
+				//加载属性文件
+				loadPropertiesFromFile(conf.getOption("spark.metrics.conf"))
+
+				// Also look for the properties in provided Spark configuration
+				//在spark配置种找属性
+				val prefix = "spark.metrics.conf."
+				conf.getAll.foreach {
+				  case (k, v) if k.startsWith(prefix) =>
+				    properties.setProperty(k.substring(prefix.length()), v)
+				  case _ =>
+				}
+
+				// Now, let's populate a list of sub-properties per instance, instance being the prefix that
+				// appears before the first dot in the property name.
+				// Add to the sub-properties per instance, the default properties (those with prefix "*"), if
+				// they don't have that exact same sub-property already defined.
+				//
+				// For example, if properties has ("*.class"->"default_class", "*.path"->"default_path,
+				// "driver.path"->"driver_path"), for driver specific sub-properties, we'd like the output to be
+				// ("driver"->Map("path"->"driver_path", "class"->"default_class")
+				// Note how class got added to based on the default property, but path remained the same
+				// since "driver.path" already existed and took precedence over "*.path"
+				//
+				perInstanceSubProperties = subProperties(properties, INSTANCE_REGEX)
+				if (perInstanceSubProperties.contains(DEFAULT_PREFIX)) {
+				  val defaultSubProperties = perInstanceSubProperties(DEFAULT_PREFIX).asScala
+				  for ((instance, prop) <- perInstanceSubProperties if (instance != DEFAULT_PREFIX);
+				       (k, v) <- defaultSubProperties if (prop.get(k) == null)) {
+				    prop.put(k, v)
+				  }
+				}
+				}
+			属性初始化
+
+		2.2.13 SparkEnv初始化
+			val envInstance = new SparkEnv(
+			  executorId,
+			  rpcEnv,
+			  serializer,
+			  closureSerializer,
+			  serializerManager,
+			  mapOutputTracker,
+			  shuffleManager,
+			  broadcastManager,
+			  blockManager,
+			  securityManager,
+			  metricsSystem,
+			  memoryManager,
+			  outputCommitCoordinator,
+			  conf)
+			可以看到,cacheManager->serializerManager,blockTransferService删掉了,httpFileServer删掉了,SparkFileDir删掉了,
+					shufflememorymanager->memorymanager,多了outputcommitcoordinator
+
+
+	2.3 创建metadataCleaner
+		这部分,原来的 metadataCleaner 似乎被取消了,换成了 spark.ContextCleaner
+		//https://www.cnblogs.com/windliu/p/10983334.html
+
+	2.4 SparkUI
+		SparkUI 提供监控,浏览器访问
+
+		事件监听体制
+			if 用函数调用,那么函数调用越来越多,线程限制,监控数据更新不及时甚至无法监视
+			函数监视是同步调用,线程容易阻塞;分布式环境种可能因为网络问题导致线程长时间背调用.
+		发送事件体制,事件处理是异步的,当前线程可以继续执行后续逻辑;系统并发度大大增加;
+		发送的事件,存入缓存,定时点读取取出后,分配给监听此事件的监听器,更新数据
+
+
+		首先看 组件 DagScheduer 产生各类 SparkListenerEvent 的源头;将各类 SparkListenerEvent 发送到 ListenBus 事件队列中
+		ListenBus 通过定时器将 SparkListenerEvent 事件匹配到具体的 SparkListener 中,改变 SparkListener 统计监控数据 由SparkUI展示
+
+		2.4.1 listenerBus 详解
+			listenerBus 类型是 LiveListenerBus;它实现了监听器模型;通过监听事件触发对各种监听器监听状态的修改,在UI刷新
+			SparkEnv -> createDriverEnv.create 方法 -> create 方法
+
+				val isDriver = executorId == SparkContext.DRIVER_IDENTIFIER
+
+				// Listener bus is only used on the driver
+				if (isDriver) {
+				  assert(listenerBus != null, "Attempted to create driver SparkEnv with null listener bus!")
+				}
+
+			SparkContext -> createSparkEnv -> 
+				SparkEnv = {SparkEnv.createDriverEnv(conf, isLocal, listenerBus, SparkContext.numDriverCores(master, conf))
+
+			LiveListenerBus 由以下部分组成:
+				事件阻塞队列: LinkedBlockingQueue[SparkListenerEvent]
