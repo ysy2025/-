@@ -7,10 +7,10 @@
 			实时计算?No
 
 			Spark通过内存计算,比磁盘快十倍以上,
-			内存直接由CPU控制，也就是CPU内部集成的内存控制器，所以说内存是直接与CPU对接，享受与CPU通信的最优带宽，然而硬盘则是通过桥接芯片(在主板上)与CPU相连，所以说速度比较慢，SATA接口目前最高速度是6GB接口也就是实际传输速度550MB/s，这也是硬盘的最快速度，其次就是与CPU直连的m.2口和pcie口，这两种接口都是通过pcie通道与CPU直连，所以说速度都在1.2G/s左右，pcie接口速度随着pcie通道数量的提升而提升，2~4G/s的读写速度都是有的
+			内存直接由CPU控制,也就是CPU内部集成的内存控制器,所以说内存是直接与CPU对接,享受与CPU通信的最优带宽,然而硬盘则是通过桥接芯片(在主板上)与CPU相连,所以说速度比较慢,SATA接口目前最高速度是6GB接口也就是实际传输速度550MB/s,这也是硬盘的最快速度,其次就是与CPU直连的m.2口和pcie口,这两种接口都是通过pcie通道与CPU直连,所以说速度都在1.2G/s左右,pcie接口速度随着pcie通道数量的提升而提升,2~4G/s的读写速度都是有的
 
 			内存的读写速度随便可以上20GB/s（50GB/s）
-			当然更快的还有CPU的那几级缓存，比如L1可以到400+GB/s的读取、200+GB/s的写入（3100+GB/s读、1600+GB/s写）。
+			当然更快的还有CPU的那几级缓存,比如L1可以到400+GB/s的读取、200+GB/s的写入（3100+GB/s读、1600+GB/s写）。
 			链接:https://www.zhihu.com/question/33272188
 
 		Spark特点:
@@ -181,7 +181,7 @@
 			Utils.setLogLevel(org.apache.log4j.Level.toLevel(upperCased))
 			/*
 			require和assert都用于在运行时执行某些检查来验证某些条件:https://blog.csdn.net/u013007900/article/details/79179683
-			require是不可取消的，它会在库（包括内部库）中使用，以通知调用者调用给定方法/函数的先决条件，例如，被用于限制某些参数。这样对于开发人员严非常有意义。
+			require是不可取消的,它会在库（包括内部库）中使用,以通知调用者调用给定方法/函数的先决条件,例如,被用于限制某些参数。这样对于开发人员严非常有意义。
 			这里是要求sc验证loglevel,需要满足条件
 			
 			然后利用Utils来设置loglevel
@@ -275,28 +275,28 @@
 
 			1、调用栈分析
 			(1)Driver端
-			Driver端创建SparkEnv对象是在SparkContext中进行的，调用栈如下:SparkContext#createSparkEnv ----> SparkEnv.createDriverEnv --------> SparkEnv.create
+			Driver端创建SparkEnv对象是在SparkContext中进行的,调用栈如下:SparkContext#createSparkEnv ----> SparkEnv.createDriverEnv --------> SparkEnv.create
 			(2)Executor端
-			Executor端创建SparkEnv对象的过程是，CoarseGrainedExecutorBackend#run ----> SparkEnv.createExecutorEnv --------> SparkEnv.create
+			Executor端创建SparkEnv对象的过程是,CoarseGrainedExecutorBackend#run ----> SparkEnv.createExecutorEnv --------> SparkEnv.create
 
 			2,RpcEnv 分析
 			Spark中Driver端和Executor端通信主要通过RpcEnv来实现。两端的RpcEnv对象创建过程在SparkEnv#create方法中已经看到过了。
-			有关Rpc的代码在org.apache.spark.rpc包中，其中还有一个名为netty的子package
+			有关Rpc的代码在org.apache.spark.rpc包中,其中还有一个名为netty的子package
 			总共涉及以下三种类
-			环境相关，主要包括RpcEnv, NettyRpcEnv,RpcEnvConfig,NettyRpcEnvFactory，
-			Server相关，主要是RpcEndpoint，ThreadSafeRpcEndpoint，
-			Client相关，代表RpcEndpoint的引用，比如RpcEndpointRef,NettyRpcEndpointRef
+			环境相关,主要包括RpcEnv, NettyRpcEnv,RpcEnvConfig,NettyRpcEnvFactory,
+			Server相关,主要是RpcEndpoint,ThreadSafeRpcEndpoint,
+			Client相关,代表RpcEndpoint的引用,比如RpcEndpointRef,NettyRpcEndpointRef
 
 				1、RpcEnv生成调用栈
-				生成RpcEnv对象的基本调用过程如下所示，最终是通过NettyRpcEnvFactory#create方法得到了一个NettyRpcEnv对象，NettyRpcEnv继承自RpcEnv类。
+				生成RpcEnv对象的基本调用过程如下所示,最终是通过NettyRpcEnvFactory#create方法得到了一个NettyRpcEnv对象,NettyRpcEnv继承自RpcEnv类。
 				SparkEnv#create ----> RpcEnv#create --------> NettyRpcEnvFactory#create
 
-				RpcEnv#create 在RpcEnv中有两个create方法，该方法的实现以及在SparkEnv中的调用方式
+				RpcEnv#create 在RpcEnv中有两个create方法,该方法的实现以及在SparkEnv中的调用方式
 				/**
 				* systemName: sparkDeiver/sparkExecutor
-				* bindAddress: Driver端IP地址，或者Executor端的IP地址
-				* advertiseAddress: Driver端IP地址，或者Executor端的IP地址
-				* port: Executor端为空，Driver端启动时的端口号
+				* bindAddress: Driver端IP地址,或者Executor端的IP地址
+				* advertiseAddress: Driver端IP地址,或者Executor端的IP地址
+				* port: Executor端为空,Driver端启动时的端口号
 				*/
 				val rpcEnv = RpcEnv.create(systemName, bindAddress, advertiseAddress, port, conf, securityManager, clientMode = !isDriver)
 
@@ -592,6 +592,7 @@
 		ListenBus 通过定时器将 SparkListenerEvent 事件匹配到具体的 SparkListener 中,改变 SparkListener 统计监控数据 由SparkUI展示
 
 		2.4.1 listenerBus 详解
+			参考 https://masterwangzx.com/2020/07/22/listener-bus/#listenerbus
 			listenerBus 类型是 LiveListenerBus;它实现了监听器模型;通过监听事件触发对各种监听器监听状态的修改,在UI刷新
 			SparkEnv -> createDriverEnv.create 方法 -> create 方法
 
@@ -607,3 +608,362 @@
 
 			LiveListenerBus 由以下部分组成:
 				事件阻塞队列: LinkedBlockingQueue[SparkListenerEvent]
+				监听器数组:ArrayBuffer[SparkListener],存放各类监听器SparkListener
+				事件匹配监听器的线程:此Thread不断拉取LinkedBlockingQueue中的事件,遍历监听器,调用监听器方法
+					任何事件都在 LinkedBlockingQueue 存在一段时间,Thread处理后,清除之
+				ListenerBus,监听,到站就下车
+
+
+			书里面的,LiveListenerBus的事件处理实现,spark2.4.7中,
+				private[spark] class LiveListenerBus(conf: SparkConf) {
+				  ...
+				  private val queues = new CopyOnWriteArrayList[AsyncEventQueue]()
+				  // Visible for testing.
+				  val@volatile private[scheduler] var queuedEvents = new mutable.ListBuffer[SparkListenerEvent]()
+				  ...
+
+			在spark.scheduler.AsyncEventQueue中
+			AsyncEventQueue继承自SparkListenerBus是事件的异步队列,事件的分发都将分配独立的线程,防止在监听器和事件较多的情况下,同步调用造成事件积压的情况
+
+		2.4.2 构造 JobProgressListener
+			JobProgressListener, 通过监听ListenerBus中的事件更新任务进度. SparkStatusTracker,和SparkUI,实际上也是通过 JobProgressListener, 来实现任务状态跟踪的
+			但是这一套似乎已经取消了;或者换成其他部分了
+
+		2.4.3 SparkUI的创建和初始化
+			private[spark] def ui: Option[SparkUI] = _ui
+			_ui =
+			  if (conf.getBoolean("spark.ui.enabled", true)) {
+			    Some(SparkUI.create(Some(this), _statusStore, _conf, _env.securityManager, appName, "",
+			      startTime))
+			  } else {
+			    // For tests, do not enable the UI
+			    None
+			  }
+		可以通过 spark.ui.enabled 对sparkui进行调节
+		create方法,SparkUI.create
+			def create(
+				sc: Option[SparkContext],
+				store: AppStatusStore,
+				conf: SparkConf,
+				securityManager: SecurityManager,
+				appName: String,
+				basePath: String,
+				startTime: Long,
+				appSparkVersion: String = org.apache.spark.SPARK_VERSION): SparkUI = {
+
+				new SparkUI(store, sc, conf, securityManager, appName, basePath, startTime, appSparkVersion)
+				}
+
+		这里的create方法,比老版本方法,简化了;减少了外来参数
+
+		2.4.4 SparkUI 的页面布局和展示
+			JobsTab为案例
+			JobsTab 复用SparkUI的killEnabled,SparkContext,JobProgressListener,包括 AllJobsPage,JobPage两个页面
+
+			首先,是initialize中调用jobsTab
+				def initialize(): Unit = {
+				    val jobsTab = new JobsTab(this, store)
+				    attachTab(jobsTab)
+				    val stagesTab = new StagesTab(this, store)
+				    attachTab(stagesTab)
+				    attachTab(new StorageTab(this, store))
+				    attachTab(new EnvironmentTab(this, store))
+				    attachTab(new ExecutorsTab(this))
+				    addStaticHandler(SparkUI.STATIC_RESOURCE_DIR)
+				    attachHandler(createRedirectHandler("/", "/jobs/", basePath = basePath))
+				    attachHandler(ApiRootResource.getServletHandler(this))
+
+				    // These should be POST only, but, the YARN AM proxy won't proxy POSTs
+				    attachHandler(createRedirectHandler(
+				      "/jobs/job/kill", "/jobs/", jobsTab.handleKillRequest, httpMethods = Set("GET", "POST")))
+				    attachHandler(createRedirectHandler(
+				      "/stages/stage/kill", "/stages/", stagesTab.handleKillRequest,
+				      httpMethods = Set("GET", "POST")))
+				  }
+			然后,JobsTab的实现 spark.ui.jobs.jobsTab
+				private[ui] class JobsTab(parent: SparkUI, store: AppStatusStore)
+				  extends SparkUITab(parent, "jobs") {
+
+				  val sc = parent.sc
+				  val killEnabled = parent.killEnabled
+
+				  // Show pool information for only live UI.
+				  def isFairScheduler: Boolean = {
+				    sc.isDefined &&
+				    store
+				      .environmentInfo()
+				      .sparkProperties
+				      .contains(("spark.scheduler.mode", SchedulingMode.FAIR.toString))
+				  }
+
+				  def getSparkUser: String = parent.getSparkUser
+
+				  attachPage(new AllJobsPage(this, store))
+				  attachPage(new JobPage(this, store))
+				  ...}
+
+			AllJobsPage由render方法渲染,利用统计监控数据生成激活完成失败等状态
+				spark.ui.jobs.AllJobsPage
+			该类,实现了JOBS_LEGEND,EXECUTORS_LEGEND等参数;makeJobEvent方法;makeExecutorEvent方法;makeTimeline方法
+				jobsTable方法等,通过render渲染生成.值得注意的是,这里面涉及html脚本;可见,通过脚本里面的参数来渲染.
+
+				def render(request: HttpServletRequest): Seq[Node] = {
+				  val appInfo = store.applicationInfo()
+				  val startTime = appInfo.attempts.head.startTime.getTime()
+				  val endTime = appInfo.attempts.head.endTime.getTime()
+				  val activeJobs = new ListBuffer[v1.JobData]()
+				  val completedJobs = new ListBuffer[v1.JobData]()
+				  val failedJobs = new ListBuffer[v1.JobData]()
+				  ...
+				  val activeJobsTable =
+				    jobsTable(request, "active", "activeJob", activeJobs, killEnabled = parent.killEnabled)
+				  val completedJobsTable =
+				    jobsTable(request, "completed", "completedJob", completedJobs, killEnabled = false)
+				  val failedJobsTable =
+				    jobsTable(request, "failed", "failedJob", failedJobs, killEnabled = false)
+				  val shouldShowActiveJobs = activeJobs.nonEmpty
+				  val shouldShowCompletedJobs = completedJobs.nonEmpty
+				  ...
+				  val schedulingMode = store.environmentInfo().sparkProperties.toMap
+				    .get("spark.scheduler.mode")
+				    .map { mode => SchedulingMode.withName(mode).toString }
+				    .getOrElse("Unknown")
+				  val summary: NodeSeq =
+				    <div>
+				      <ul class="unstyled">
+				        <li>
+				          <strong>User:</strong>
+				          {parent.getSparkUser}
+				        </li>
+				        <li>
+				          <strong>Total Uptime:</strong>
+				          {
+				            if (endTime < 0 && parent.sc.isDefined) {
+				              UIUtils.formatDuration(System.currentTimeMillis() - startTime)
+				            } else if (endTime > 0) {
+				              UIUtils.formatDuration(endTime - startTime)
+				            }
+				          }
+				        </li>
+				        ...
+				        {
+				          if (shouldShowActiveJobs) {
+				            <li>
+				              <a href="#active"><strong>Active Jobs:</strong></a>
+				              {activeJobs.size}
+				            </li>
+				          }
+				        }
+				        ...
+				        {
+				          if (shouldShowFailedJobs) {
+				            <li>
+				              <a href="#failed"><strong>Failed Jobs:</strong></a>
+				              {failedJobs.size}
+				            </li>
+				          }
+				        }
+				      </ul>
+				    </div>
+				  var content = summary
+				  content ++= makeTimeline(activeJobs ++ completedJobs ++ failedJobs,
+				    store.executorList(false), startTime)
+				  ...
+				  if (shouldShowCompletedJobs) {
+				    content ++=
+				      <span id="completed" class="collapse-aggregated-completedJobs collapse-table"
+				          onClick="collapseTable('collapse-aggregated-completedJobs','aggregated-completedJobs')">
+				        <h4>
+				          <span class="collapse-table-arrow arrow-open"></span>
+				          <a>Completed Jobs ({completedJobNumStr})</a>
+				        </h4>
+				      </span> ++
+				      <div class="aggregated-completedJobs collapsible-table">
+				        {completedJobsTable}
+				      </div>
+				  }
+				  ...
+				  val helpText = """A job is triggered by an action, like count() or saveAsTextFile().""" +
+				    " Click on a job to see information about the stages of tasks inside it."
+				  UIUtils.headerSparkPage(request, "Spark Jobs", content, parent, helpText = Some(helpText))
+				}
+			大致的思路是,形成参数,嵌入html脚本
+
+			JobsTable也一样,用来生成表格数据;在 spark.ui.jobs.AllJobsPage.jobsTable
+				private def jobsTable(
+				    request: HttpServletRequest,
+				    tableHeaderId: String,
+				    jobTag: String,
+				    jobs: Seq[v1.JobData],
+				    killEnabled: Boolean): Seq[Node] = {
+				  // stripXSS is called to remove suspicious characters used in XSS attacks
+				  val allParameters = request.getParameterMap.asScala.toMap.map { case (k, v) =>
+				    UIUtils.stripXSS(k) -> v.map(UIUtils.stripXSS).toSeq
+				  }
+				  ...
+				  val parameterJobPage = UIUtils.stripXSS(request.getParameter(jobTag + ".page"))
+				  ...
+				  val jobSortColumn = Option(parameterJobSortColumn).map { sortColumn =>
+				    UIUtils.decodeURLParameter(sortColumn)
+				  }.getOrElse(jobIdTitle)
+				  ...
+				  val page: Int = {
+				    // If the user has changed to a larger page size, then go to page 1 in order to avoid
+				    // IndexOutOfBoundsException.
+				    if (jobPageSize <= jobPrevPageSize) {
+				      jobPage
+				    } else {
+				      1
+				    }
+				  }
+				  val currentTime = System.currentTimeMillis()
+				  try {
+				    new JobPagedTable(
+				      store,
+				      jobs,
+				      tableHeaderId,
+				      jobTag,
+				      UIUtils.prependBaseUri(request, parent.basePath),
+				      "jobs", // subPath
+				      parameterOtherTable,
+				      killEnabled,
+				      currentTime,
+				      jobIdTitle,
+				      pageSize = jobPageSize,
+				      sortColumn = jobSortColumn,
+				      desc = jobSortDesc
+				    ).table(page)
+				  } catch {
+				    case e @ (_ : IllegalArgumentException | _ : IndexOutOfBoundsException) =>
+				      <div class="alert alert-error">
+				        <p>Error while rendering job table:</p>
+				        <pre>
+				          {Utils.exceptionString(e)}
+				        </pre>
+				      </div>
+				  }
+				}
+			同样,获取参数,然后嵌套进html脚本
+
+			老版本中表格中的数据,通过makeRow方法渲染的;2.4.7中,通过jobRow方法渲染
+				// Convert JobUIData to JobTableRowData which contains the final contents to show in the table
+				// so that we can avoid creating duplicate contents during sorting the data
+				private val data = jobs.map(jobRow).sorted(ordering(sortColumn, desc))
+				private var _slicedJobIds: Set[Int] = null
+				override def dataSize: Int = data.size
+				override def sliceData(from: Int, to: Int): Seq[JobTableRowData] = {
+				  val r = data.slice(from, to)
+				  _slicedJobIds = r.map(_.jobData.jobId).toSet
+				  r
+				}
+				private def jobRow(jobData: v1.JobData): JobTableRowData = {
+				  val duration: Option[Long] = {
+				    jobData.submissionTime.map { start =>
+				      val end = jobData.completionTime.map(_.getTime()).getOrElse(System.currentTimeMillis())
+				      end - start.getTime()
+				    }
+				  }
+				  val formattedDuration = duration.map(d => UIUtils.formatDuration(d)).getOrElse("Unknown")
+				  val submissionTime = jobData.submissionTime
+				  val formattedSubmissionTime = submissionTime.map(UIUtils.formatDate).getOrElse("Unknown")
+				  val (lastStageName, lastStageDescription) = lastStageNameAndDescription(store, jobData)
+				  val jobDescription = UIUtils.makeDescription(lastStageDescription, basePath, plainText = false)
+				  val detailUrl = "%s/jobs/job/?id=%s".format(basePath, jobData.jobId)
+				  new JobTableRowData(
+				    jobData,
+				    lastStageName,
+				    lastStageDescription,
+				    duration.getOrElse(-1),
+				    formattedDuration,
+				    submissionTime.map(_.getTime()).getOrElse(-1L),
+				    formattedSubmissionTime,
+				    jobDescription,
+				    detailUrl
+				  )
+				}
+
+			上面spark.ui.jobs.jobsTab最后的 attachPage, 是spark.ui.WebUI.WebUITab 的attachPage方法
+			WebUI 是SparkUI的父类
+			WebUITab类维护   val pages = ArrayBuffer[WebUIPage]()
+							val name = prefix.capitalize
+			AllJobsPage 和 JobPage 会放入ArrayBuffer中
+				private[spark] abstract class WebUITab(parent: WebUI, val prefix: String) {
+				  val pages = ArrayBuffer[WebUIPage]()
+				  val name = prefix.capitalize
+
+				  /** Attach a page to this tab. This prepends the page's prefix with the tab's own prefix. */
+				  def attachPage(page: WebUIPage) {
+				    page.prefix = (prefix + "/" + page.prefix).stripSuffix("/")
+				    pages += page
+				  }
+
+				  /** Get a list of header tabs from the parent UI. */
+				  def headerTabs: Seq[WebUITab] = parent.getTabs
+
+				  def basePath: String = parent.getBasePath
+				}
+
+				JobsTab创建以后, 通过 SparkUI.initialize 的 jobsTab = new JobsTab(this, store)
+														   attachTab(jobsTab)
+				被 attachTab 方法加入SparkUI的 ArrayBuffer[WebUIPage] 中,
+				attachTab 在 WebUI中, 
+					def attachTab(tab: WebUITab): Unit = {
+						tab.pages.foreach(attachPage)
+						tabs += tab
+					}
+				可见, attachTab 会调用 WebUI.attachPage 方法; 从而调用attachHandler方法->JettyUtils的createServletHandler一步步到底层
+
+		2.4.5 SparkUI 启动
+			SparkUI 创建好后,通过WebUI的bind方法,绑定服务和端口;bind方法实现如下
+				def bind(): Unit = {
+				  assert(serverInfo.isEmpty, s"Attempted to bind $className more than once!")
+				  try {
+				    val host = Option(conf.getenv("SPARK_LOCAL_IP")).getOrElse("0.0.0.0")
+				    serverInfo = Some(startJettyServer(host, port, sslOptions, handlers, conf, name))
+				    logInfo(s"Bound $className to $host, and started at $webUrl")
+				  } catch {
+				    case e: Exception =>
+				      logError(s"Failed to bind $className", e)
+				      System.exit(1)
+				  }
+				}
+			通过调用 JettyUtils.startJettyServer,启动服务
+			//关于 Jetty: https://blog.csdn.net/zhangxuyan123/article/details/81219404
+
+	2.5 Hadoop 相关配置和Executor环境变量
+		2.5.1 Hadoop相关配置信息
+			SparkContext 中, Hadoop相关配置代码如下
+		    	_hadoopConfiguration = SparkHadoopUtil.get.newConfiguration(_conf)
+		    获取的配置信息有
+		2.5.2 Executor环境变量
+			executorENvs包含的环境变量,将会在注册应用过程中发送给Master;Master给worker发送调度,worker最终使用executorenvs提供的信息启动Executor
+			spark.executor.memory 是executor占用的内存大小;可以配置
+				_executorMemory = _conf.getOption("spark.executor.memory")
+				.orElse(Option(System.getenv("SPARK_EXECUTOR_MEMORY")))
+				.orElse(Option(System.getenv("SPARK_MEM"))
+				.map(warnSparkMem))
+				.map(Utils.memoryStringToMb)
+				.getOrElse(1024)
+
+			executorEnvs 定义过程如下
+			// Environment variables to pass to our executors.
+  			private[spark] val executorEnvs = HashMap[String, String]()
+
+
+			// Convert java options to env vars as a work around
+			// since we can't set env vars directly in sbt.
+			for { (envKey, propKey) <- Seq(("SPARK_TESTING", "spark.testing"))
+			  value <- Option(System.getenv(envKey)).orElse(Option(System.getProperty(propKey)))} {
+			  executorEnvs(envKey) = value
+			}
+			Option(System.getenv("SPARK_PREPEND_CLASSES")).foreach { v =>
+			  executorEnvs("SPARK_PREPEND_CLASSES") = v
+			}
+			// The Mesos scheduler backend relies on this environment variable to set executor memory.
+			// TODO: Set this only in the Mesos scheduler.
+			executorEnvs("SPARK_EXECUTOR_MEMORY") = executorMemory + "m"
+			executorEnvs ++= _conf.getExecutorEnv
+			
+			executorEnvs("SPARK_USER") = sparkUser
+
+	2.6 创建任务调度器 TaskScheduler
