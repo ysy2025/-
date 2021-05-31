@@ -967,3 +967,72 @@
 			executorEnvs("SPARK_USER") = sparkUser
 
 	2.6 创建任务调度器 TaskScheduler
+		负责任务的提交,请求集群管理器对任务调度.也可以视作任务调度的客户端.
+		换了代码了,不是 var(schedulerbackend, taskscheduler)了,而且多了deployMode参数
+		// Create and start the scheduler
+    	val (sched, ts) = SparkContext.createTaskScheduler(this, master, deployMode)
+    	createTaskScheduler 会根据master的配置匹配部署模式,创建taskschedulerimpl,并且生成不同的schedulerbackend
+    	local,standalone,ya和集群三种模式
+
+    	local模式下为例
+			private def createTaskScheduler(
+			    sc: SparkContext,
+			    master: String,
+			    deployMode: String): (SchedulerBackend, TaskScheduler) = {
+			  import SparkMasterRegex._
+			  // When running locally, don't try to re-execute tasks on failure.
+			  val MAX_LOCAL_TASK_FAILURES = 1
+			  master match {
+			    case "local" =>
+			      val scheduler = new TaskSchedulerImpl(sc, MAX_LOCAL_TASK_FAILURES, isLocal = true)
+			      val backend = new LocalSchedulerBackend(sc.getConf, scheduler, 1)
+			      scheduler.initialize(backend)
+			      (backend, scheduler)
+
+		2.6.1 创建taskschedulerimpl
+			1,从sparkconf中读取配置信息,例如每个任务的cpu,调度模式等
+			2,创建taskresultgetter,通过线程池,对worker上的executor发送的task的执行结果进行处理
+				def this(sc: SparkContext, maxTaskFailures: Int, isLocal: Boolean) = {
+				    this(
+				      sc,
+				      maxTaskFailures,
+				      TaskSchedulerImpl.maybeCreateBlacklistTracker(sc),
+				      isLocal = isLocal)
+				  }
+
+				  val conf = sc.conf
+
+				  // How often to check for speculative tasks
+				  val SPECULATION_INTERVAL_MS = conf.getTimeAsMs("spark.speculation.interval", "100ms")
+
+				...
+
+				  // CPUs to request per task
+				  val CPUS_PER_TASK = conf.getInt("spark.task.cpus", 1)
+
+				...
+
+				  // Listener object to pass upcalls into
+				  var dagScheduler: DAGScheduler = null
+
+				  var backend: SchedulerBackend = null
+
+				  val mapOutputTracker = SparkEnv.get.mapOutputTracker
+
+				  private var schedulableBuilder: SchedulableBuilder = null
+				  // default scheduler is FIFO
+				  private val schedulingModeConf = conf.get(SCHEDULER_MODE_PROPERTY, SchedulingMode.FIFO.toString)
+				  val schedulingMode: SchedulingMode =
+				    try {
+				      SchedulingMode.withName(schedulingModeConf.toUpperCase(Locale.ROOT))
+				    } catch {
+				      case e: java.util.NoSuchElementException =>
+				        throw new SparkException(s"Unrecognized $SCHEDULER_MODE_PROPERTY: $schedulingModeConf")
+				    }
+			调度模式,有fair和fifo两种;
+			最终任务的调度,都是落实到接口schedulerbackend的具体实现上的
+			看看 local模式下,schedulerbackend的实现,localbackend;
+				localbackend,依赖于localactor与actorsystem进行消息通信
+				val backend = new LocalSchedulerBackend(sc.getConf, scheduler, 1)
+				上述代码告诉我们,LocalSchedulerBackend替代了localbackend
+				后续继续深入挖掘
