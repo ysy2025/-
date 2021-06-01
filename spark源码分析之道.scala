@@ -1035,4 +1035,168 @@
 				localbackend,依赖于localactor与actorsystem进行消息通信
 				val backend = new LocalSchedulerBackend(sc.getConf, scheduler, 1)
 				上述代码告诉我们,LocalSchedulerBackend替代了localbackend
-				后续继续深入挖掘
+				后续继续深入挖
+
+
+	2.7 创建和启动DAGScheduler
+		DagScheduer 主要任务, 任务交给 TaskSchedulerImpl 提交之前,做准备工作
+		创建Job;将DAG中的RDD划分到不通的Stage;提交stage
+
+		SparkContext中的代码
+			volatile 关键字是一种类型修饰符,用它声明的类型变量表示可以被某些编译器未知的因素更改
+			@volatile private var _dagScheduler: DAGScheduler = _
+
+			// Create and start the scheduler
+		    val (sched, ts) = SparkContext.createTaskScheduler(this, master, deployMode)
+		    _schedulerBackend = sched
+		    _taskScheduler = ts
+		    _dagScheduler = new DAGScheduler(this)
+		    _heartbeatReceiver.ask[Boolean](TaskSchedulerIsSet)
+
+		DagScheduer 维护jobID和stageID的关系,stage,activeJob,以及缓存的RDD的partitions 的位置信息
+			DAGScheduler.scala脚本中
+
+			class DAGScheduler(
+			    private[scheduler] val sc: SparkContext,
+			    private[scheduler] val taskScheduler: TaskScheduler,
+			    listenerBus: LiveListenerBus,
+			    mapOutputTracker: MapOutputTrackerMaster,
+			    blockManagerMaster: BlockManagerMaster,
+			    env: SparkEnv,
+			    clock: Clock = new SystemClock())
+			  extends Logging {
+
+			  def this(sc: SparkContext, taskScheduler: TaskScheduler) = {
+			    this(
+			      sc,
+			      taskScheduler,
+			      sc.listenerBus,
+			      sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster],
+			      sc.env.blockManager.master,
+			      sc.env)
+			  }
+
+			  def this(sc: SparkContext) = this(sc, sc.taskScheduler)
+
+			  private[spark] val metricsSource: DAGSchedulerSource = new DAGSchedulerSource(this)
+
+			  private[scheduler] val nextJobId = new AtomicInteger(0)
+			  private[scheduler] def numTotalJobs: Int = nextJobId.get()
+			  private val nextStageId = new AtomicInteger(0)
+
+			  private[scheduler] val jobIdToStageIds = new HashMap[Int, HashSet[Int]]
+			  private[scheduler] val stageIdToStage = new HashMap[Int, Stage]
+
+		这里面,是定义 DagScheduer时给定的参数
+
+			// A closure serializer that we reuse.
+			// This is only safe because DAGScheduler runs in a single thread.
+			private val closureSerializer = SparkEnv.get.closureSerializer.newInstance()
+
+		同时,要注意,private [scheduler] val outputCommitCoordinator = env.outputCommitCoordinator;似乎替代了书里面的
+		dagSchedulerActorSupervisor,dagScheduler检测器
+
+		DAGScheduler构造的时候,调用 initializeEventProcessActor,似乎没有了
+		https://blog.csdn.net/qq_16669583/article/details/106026722
+
+
+	2.8 TaskScheduler 启动
+		SparkContext.scala脚本中启动
+			// start TaskScheduler after taskScheduler sets DAGScheduler reference in DAGScheduler's
+			// constructor
+			_taskScheduler.start()
+		taskScheduler的启动,实际调用了 TaskScheduler.scala的start trait;并不是书中说的backend的start方法;书里面是老代码了
+
+		2.8.1 创建LocalActor	
+			构建local 的 executor;注意,原书是localactor,新代码是localendpoint
+			actor->endpoint
+			private[spark] class LocalEndpoint(
+			    override val rpcEnv: RpcEnv,
+			    userClassPath: Seq[URL],
+			    scheduler: TaskSchedulerImpl,
+			    executorBackend: LocalSchedulerBackend,
+			    private val totalCores: Int)
+			  extends ThreadSafeRpcEndpoint with Logging {
+
+			  private var freeCores = totalCores
+
+			  val localExecutorId = SparkContext.DRIVER_IDENTIFIER
+			  val localExecutorHostname = "localhost"
+
+			  private val executor = new Executor(
+			    localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true)
+
+			  override def receive: PartialFunction[Any, Unit] = {
+			    case ReviveOffers =>
+			      reviveOffers()
+			  ...
+
+			Executor的构建 Executor.scala
+
+				private[spark] class Executor(
+				    executorId: String,
+				    executorHostname: String,
+				    env: SparkEnv,
+				    userClassPath: Seq[URL] = Nil,
+				    isLocal: Boolean = false,
+				    uncaughtExceptionHandler: UncaughtExceptionHandler = SparkUncaughtExceptionHandler)
+				  extends Logging {
+
+				  logInfo(s"Starting executor ID $executorId on host $executorHostname")
+
+				  ...
+				  // No ip or host:port - just hostname
+				  Utils.checkHost(executorHostname, "Expected executed slave to be a hostname")
+				  ...
+				  if (!isLocal) {
+				    // Setup an uncaught exception handler for non-local mode.
+				    // Make any thread terminations due to uncaught exceptions kill the entire
+				    // executor process to avoid surprising stalls.
+				    Thread.setDefaultUncaughtExceptionHandler(uncaughtExceptionHandler)
+				  }
+
+				  // Start worker thread pool
+				  private val threadPool = {
+				    val threadFactory = new ThreadFactoryBuilder()
+				      .setDaemon(true)
+				      .setNameFormat("Executor task launch worker-%d")
+				      .setThreadFactory(new ThreadFactory {
+				        override def newThread(r: Runnable): Thread =
+				          // Use UninterruptibleThread to run tasks so that we can allow running codes without being
+				          // interrupted by `Thread.interrupt()`. Some issues, such as KAFKA-1894, HADOOP-10622,
+				          // will hang forever if some methods are interrupted.
+				          new UninterruptibleThread(r, "unused") // thread name will be set by ThreadFactoryBuilder
+				      })
+				      .build()
+				    Executors.newCachedThreadPool(threadFactory).asInstanceOf[ThreadPoolExecutor]
+				  }
+
+					private val executorSource = new ExecutorSource(threadPool, executorId)
+					// Pool used for threads that supervise task killing / cancellation
+					private val taskReaperPool = ThreadUtils.newDaemonCachedThreadPool("Task reaper")
+
+				前面的准备工作:
+					定义当前的文件,jar包;emmpty_byte_buffer;conf
+					检查host
+					确保没有specified的host
+					如果是local模式怎么办
+
+					启动worker线程池
+
+				创建并注册 executorSource; 执行器资源
+				获取sparkEnv
+					如果不是local的情况下
+					  if (!isLocal) {
+						    env.metricsSystem.registerSource(executorSource)
+						    env.blockManager.initialize(conf.getAppId)
+						  }
+				然后,创建注册 taskreaper?
+				创建 urlclassloader, 用来加载任务上传的jar包中的类,对任务的环境进行隔离
+
+				创建executor 执行 task的线程池
+				创建 executor 的心跳线程,用来给driver发送心跳
+					// Executor for the heartbeat task.
+					private val heartbeater = ThreadUtils.newDaemonSingleThreadScheduledExecutor("driver-heartbeater")
+
+
+		2.8.2 ExecutorSource 的创建和注册
