@@ -1107,7 +1107,7 @@
 			_taskScheduler.start()
 		taskScheduler的启动,实际调用了 TaskScheduler.scala的start trait;并不是书中说的backend的start方法;书里面是老代码了
 
-		2.8.1 创建LocalActor	
+		2.8.1 创建LocalActor	 Actor->EndPoint
 			构建local 的 executor;注意,原书是localactor,新代码是localendpoint
 			actor->endpoint
 			private[spark] class LocalEndpoint(
@@ -1200,3 +1200,107 @@
 
 
 		2.8.2 ExecutorSource 的创建和注册
+			ExecutorSource 用于测量系统; metricRegistry 的register 方法注册计量;这些计量信息包括:
+				threadpool.activeTasks, threadpool.compeleteTasks, threadpool.currentPoolsize, threadpool.maxPoolsize, filesystem.hdfs.largeReadops,filesystem.hdfs.writeops
+			实现方式如下
+				首先是Executor.scala脚本中
+				private val executorSource = new ExecutorSource(threadPool, executorId)
+				定义了executorSource
+				然后,是ExecutorSource类
+					class ExecutorSource(threadPool: ThreadPoolExecutor, executorId: String) extends Source {
+
+					  private def fileStats(scheme: String) : Option[FileSystem.Statistics] =
+					    FileSystem.getAllStatistics.asScala.find(s => s.getScheme.equals(scheme))
+
+					  private def registerFileSystemStat[T](
+					        scheme: String, name: String, f: FileSystem.Statistics => T, defaultValue: T) = {
+					    metricRegistry.register(MetricRegistry.name("filesystem", scheme, name), new Gauge[T] {
+					      override def getValue: T = fileStats(scheme).map(f).getOrElse(defaultValue)
+					    })
+					  }
+
+					  override val metricRegistry = new MetricRegistry()
+
+					  override val sourceName = "executor"
+					  ...
+
+				这里调用了很多metricRegistry;
+
+			创建完 Executorsource之后,调用metricssystem的 registersource,将executorsource注册到metricssystem中
+			registersource方法,利用metricregistry的register方法注册
+
+			MetricsSystem.scala方法中 
+				def registerSource(source: Source) {
+				  sources += source
+				  try {
+				    val regName = buildRegistryName(source)
+				    registry.register(regName, source.metricRegistry)
+				  } catch {
+				    case e: IllegalArgumentException => logInfo("Metrics already registered", e)
+				  }
+				}
+
+		2.8.3 ExecutorActor的构建和注册
+			原书的 ExecutorActor的构建和注册,利用到的,receivewithlogging,在BlockManagerSlaveEndpoint中
+			override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+				...
+				case TriggerThreadDump =>
+				context.reply(Utils.getThreadDump())
+			}
+
+		2.8.4 Spark 自身 ClassLoader 的创建
+			获取要创建的 ClassLoader的父加载器currentLoader, 然后根据currentjars,生成url数组
+			spark.userclasspathfirst,属性指定加载类时,是否先从用户的classpath下加载?
+			最后创建executorurlclassloader或者childexecutorurlclassloader
+
+			仍然是在 Executor.scala文件中
+				private def createClassLoader(): MutableURLClassLoader = {
+				  // Bootstrap the list of jars with the user class path.
+				  val now = System.currentTimeMillis()
+				  userClassPath.foreach { url =>
+				    currentJars(url.getPath().split("/").last) = now
+				  }
+				  val currentLoader = Utils.getContextOrSparkClassLoader
+				  // For each of the jars in the jarSet, add them to the class loader.
+				  // We assume each of the files has already been fetched.
+				  val urls = userClassPath.toArray ++ currentJars.keySet.map { uri =>
+				    new File(uri.split("/").last).toURI.toURL
+				  }
+				  if (userClassPathFirst) {
+				    new ChildFirstURLClassLoader(urls, currentLoader)
+				  } else {
+				    new MutableURLClassLoader(urls, currentLoader)
+				  }
+				}
+
+			原书中,userclasspathfirst需要自己获取参数,conf.getboolean;现在是作为参数 userclasspath 传进executor类中
+			然后,在前面就通过
+				// Whether to load classes in user jars before those in Spark jars
+				private val userClassPathFirst = conf.getBoolean("spark.executor.userClassPathFirst", false)
+			获取到了该参数的具体值
+
+			Utils.getContextOrSparkClassLoader, 通过Utils.scala中的getContextOrSparkClassLoader方法获得
+			ChildFirstURLClassLoader 继承了 MutableURLClassLoader类;MutableURLClassLoader继承了URLClassLoader
+
+			如果需要 repl 交互,海湖调用addreplclassloaderifneeded
+				private def addReplClassLoaderIfNeeded(parent: ClassLoader): ClassLoader = {
+				    val classUri = conf.get("spark.repl.class.uri", null)
+				    if (classUri != null) {
+				      logInfo("Using REPL class URI: " + classUri)
+				      try {
+				        val _userClassPathFirst: java.lang.Boolean = userClassPathFirst
+				        val klass = Utils.classForName("org.apache.spark.repl.ExecutorClassLoader")
+				          .asInstanceOf[Class[_ <: ClassLoader]]
+				        val constructor = klass.getConstructor(classOf[SparkConf], classOf[SparkEnv],
+				          classOf[String], classOf[ClassLoader], classOf[Boolean])
+				        constructor.newInstance(conf, env, classUri, parent, _userClassPathFirst)
+				      } catch {
+				        case _: ClassNotFoundException =>
+				          logError("Could not find org.apache.spark.repl.ExecutorClassLoader on classpath!")
+				          System.exit(1)
+				          null
+				      }
+				    } else {
+				      parent
+				    }
+				  }
