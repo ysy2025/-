@@ -1304,3 +1304,75 @@
 				      parent
 				    }
 				  }
+
+		2.8.5 启动Executor的心跳线程
+			smartDriverHeartbeater启动 Executor的心跳
+			Executor.scala脚本中 startdriverHeatrbeater;
+				private def startDriverHeartbeater(): Unit = {
+				    val intervalMs = conf.getTimeAsMs("spark.executor.heartbeatInterval", "10s")
+
+				    // Wait a random interval so the heartbeats don't end up in sync
+				    val initialDelay = intervalMs + (math.random * intervalMs).asInstanceOf[Int]
+
+				    val heartbeatTask = new Runnable() {
+				      override def run(): Unit = Utils.logUncaughtExceptions(reportHeartBeat())
+				    }
+				    heartbeater.scheduleAtFixedRate(heartbeatTask, initialDelay, intervalMs, TimeUnit.MILLISECONDS)
+				  }
+			心跳线程间隔,spark.executor.heartbeatInterval = 10s;超时时间=30s;超时重试3次;重试间隔3s
+				原书代码中的大段,在新代码体现为 startdriverHeatrbeater 和 reportHeartBeat 两个函数
+				心跳的作用:
+					更新正在处理的任务的测量信息
+					通知 blockmanagermaster, 此 executor上的blockmanager依然活着
+			初始化 taskschedulerimpl后,创建心跳接收器 heartbeatreceiver
+			heartbeatreceiver 接收所有分配给当前 driver application 的executor 的心跳 并将 task, task 计量信息, 心跳等
+			交给 taskSchedulerimpl 和 dagScheduler 作下一步处理
+				_heartbeatReceiver = env.rpcEnv.setupEndpoint(HeartbeatReceiver.ENDPOINT_NAME, new HeartbeatReceiver(this))
+
+			heartbeatreceiver 收到心跳后, 调用 taskScheduler 的 executorheartbeatreceived 方法
+			这个逻辑,在 HeartbeatReceiver.scala脚本中, receiveAndReply方法有体现; 
+				// Messages received from executors
+				    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId) =>
+				      if (scheduler != null) {
+				        if (executorLastSeen.contains(executorId)) {
+				          executorLastSeen(executorId) = clock.getTimeMillis()
+				          eventLoopThread.submit(new Runnable {
+				            override def run(): Unit = Utils.tryLogNonFatalError {
+				              val unknownExecutor = !scheduler.executorHeartbeatReceived(
+				                executorId, accumUpdates, blockManagerId)
+				              val response = HeartbeatResponse(reregisterBlockManager = unknownExecutor)
+				              context.reply(response)
+			而 TaskScheduler.scala脚本中有以下方法
+				def executorHeartbeatReceived(
+				    execId: String,
+				    accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+				    blockManagerId: BlockManagerId): Boolean
+
+			executorHeartbeatReceived 逻辑体现在 TaskSchedulerImpl.scala脚本中
+				override def executorHeartbeatReceived(
+				      execId: String,
+				      accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+				      blockManagerId: BlockManagerId): Boolean = {
+				    // (taskId, stageId, stageAttemptId, accumUpdates)
+				    val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = synchronized {
+				      accumUpdates.flatMap { case (id, updates) =>
+				        val accInfos = updates.map(acc => acc.toInfo(Some(acc.value), None))
+				        taskIdToTaskSetManager.get(id).map { taskSetMgr =>
+				          (id, taskSetMgr.stageId, taskSetMgr.taskSet.stageAttemptId, accInfos)
+				        }
+				      }
+				    }
+
+			dagScheduler 将executorID等信息封装,传到listenerbus中,用于更新stage的各种测量数据
+
+			最后, 给 blockmanagermaster 持有的blockmanagermasteractor发送blockmanagerheartbeat消息
+			blockmanagermasteractor会匹配执行 heartbeatReceived方法
+				private def heartbeatReceived(blockManagerId: BlockManagerId): Boolean = {
+				  if (!blockManagerInfo.contains(blockManagerId)) {
+				    blockManagerId.isDriver && !isLocal
+				  } else {
+				    blockManagerInfo(blockManagerId).updateLastSeenMs()
+				    true
+				  }
+				}
+			然后初始化 blockmanager; executor.scala脚本中
