@@ -107,3 +107,44 @@
 
 			DiskStore 			MemStore
 			DiskBlockManager 	UnifiedMemoryManager
+
+			Executor 的 BlockManager Driver 的 BlockManager 进行通信,例如注册 BlockManager,更新Block信息,获取Block在的BlockManager,删除Executor等
+			BlockManager的读写操作,从各类存储介质中取数,寸数
+			MemoryStore不足,会写入DiskStore.DiskStore;而DiskStore实际依赖于DiskBlockManager
+			访问远端节点的Executor的BlockManager
+
+			目前Spark支持 HDFS,AmazonS3两种主流分布式存储系统
+			https://www.sohu.com/a/441840842_355140
+			Spark定义了抽象类BlockStore, 目前BlockStore具体实现包括MemoryStore,DiskStore,TachyonStore
+
+
+		3.2 shuffle服务&客户端
+			Netty实现的网络服务组件,于存储体系的重要性:Spark是分布式部署的,每个Task最终都运行在不同机器节点上.
+			map任务的输出结果存在map任务所在机器的存储体系中,但是reduce任务极有可能不在同一机器上运行,所以需要netty,网络服务,实现远程下载map任务的中间输出
+
+			shuffleClient, 不仅是客户端,不光将shuffle文件上传到executor或者下载到本地客户端,还提供了可以被其他executor访问的shuffle服务
+			和Yarn一样,都是用netty作为shuffleserver
+
+			BlockTransferService只有在init方法调用,初始化后,才提供服务
+
+			NettyBlockTransferService的初始化步骤:
+				SparkEnv的 val blockTransferService = new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress, blockManagerPort, numUsableCores) ->
+				NettyBlockTransferService.init
+				override def init(blockDataManager: BlockDataManager): Unit = {
+				    val rpcHandler = new NettyBlockRpcServer(conf.getAppId, serializer, blockDataManager)
+				    var serverBootstrap: Option[TransportServerBootstrap] = None
+				    var clientBootstrap: Option[TransportClientBootstrap] = None
+				    if (authEnabled) {
+				      serverBootstrap = Some(new AuthServerBootstrap(transportConf, securityManager))
+				      clientBootstrap = Some(new AuthClientBootstrap(transportConf, conf.getAppId, securityManager))
+				    }
+				    transportContext = new TransportContext(transportConf, rpcHandler)
+				    clientFactory = transportContext.createClientFactory(clientBootstrap.toSeq.asJava)
+				    server = createServer(serverBootstrap.toList)
+				    appId = conf.getAppId
+				    logInfo(s"Server created on ${hostName}:${server.getPort}")
+				  }
+
+			Block的RPC符文,构造TransportContext(类似SparkContext),创建RPC客户端工厂 TransportClientFactory, Netty服务器TransportServer
+			现在的Netty好像被rpc替代了
+			
