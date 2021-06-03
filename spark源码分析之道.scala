@@ -1376,3 +1376,367 @@
 				  }
 				}
 			然后初始化 blockmanager; executor.scala脚本中
+
+
+	2.9 启动测量系统 MetricsSystem
+		使用 codahale 提供的第三方测量仓库 Metrics
+		MetricsSystem 有三个概念: Instance 谁在用测量数据, source 从哪收集数据, sink 往哪里输出数据;
+
+		spark 按照instance不同,有 master, worker, application, driver, executor
+		sink 有 consolesink csvsink jmxsink metricssevlet graphitesink 等
+		MetricsServlet作为默认的Sink
+		SparkContext的启动代码
+			// The metrics system for Driver need to be set spark.app.id to app ID.
+			// So it should start after we get app ID from the task scheduler and set spark.app.id.
+			_env.metricsSystem.start()
+			// Attach the driver metrics servlet handler to the web ui after the metrics system is started.
+			_env.metricsSystem.getServletHandlers.foreach(handler => ui.foreach(_.attachHandler(handler)))
+
+			start
+				def start(registerStaticSources: Boolean = true) {
+				    require(!running, "Attempting to start a MetricsSystem that is already running")
+				    running = true
+				    if (registerStaticSources) {
+				      StaticSources.allSources.foreach(registerSource)
+				      registerSources()
+				    }
+				    registerSinks()
+				    sinks.foreach(_.start)
+				  }
+		启动代码如下:SparkEnv.scala脚本中
+			val metricsSystem = if (isDriver) {
+			      // Don't start metrics system right now for Driver.
+			      // We need to wait for the task scheduler to give us an app ID.
+			      // Then we can start the metrics system.
+			      MetricsSystem.createMetricsSystem("driver", conf, securityManager)
+			    } else {
+			      // We need to set the executor ID before the MetricsSystem is created because sources and
+			      // sinks specified in the metrics configuration file will want to incorporate this executor's
+			      // ID into the metrics they report.
+			      conf.set("spark.executor.id", executorId)
+			      val ms = MetricsSystem.createMetricsSystem("executor", conf, securityManager)
+			      ms.start()
+			      ms
+			    }
+
+		MetricsSystem 启动过程如下:
+			注册source->注册sinks->给sinks增加Jetty的ServeletContextHandler
+			SparkEnv.metricsSystem -> val ms = MetricsSystem.createMetricsSystem -> MetricsSystem的objcet MetricsSystem->
+			MetricsSystem.MetricsSystem.createMetricsSystem new MetricsSystem ->MetricsSystem.scala
+			构建代码如下
+				private[spark] class MetricsSystem private (
+				    val instance: String,
+				    conf: SparkConf,
+				    securityMgr: SecurityManager)
+				  extends Logging {
+
+				  private[this] val metricsConfig = new MetricsConfig(conf)
+
+				  private val sinks = new mutable.ArrayBuffer[Sink]
+				  private val sources = new mutable.ArrayBuffer[Source]
+				  private val registry = new MetricRegistry()
+
+				  private var running: Boolean = false
+
+				  // Treat MetricsServlet as a special sink as it should be exposed to add handlers to web ui
+				  private var metricsServlet: Option[MetricsServlet] = None
+		可见,是_env.metricsSystem.start()这个逻辑启动metricssystem
+		_env.metricsSystem.getServletHandlers.foreach(handler => ui.foreach(_.attachHandler(handler)))启动了handler
+		attachHandler->new ServletParams(request => getMetricsSnapshot(request), "text/json"), securityMgr, conf) -> getMetricsSnapshot
+
+		2.9.1 注册sources
+			registersources 注册 sources
+			告诉测量系统从哪收集数据
+				private def registerSources() {
+				  val instConfig = metricsConfig.getInstance(instance)
+				  val sourceConfigs = metricsConfig.subProperties(instConfig, MetricsSystem.SOURCE_REGEX)
+				  // Register all the sources related to instance
+				  sourceConfigs.foreach { kv =>
+				    val classPath = kv._2.getProperty("class")
+				    try {
+				      val source = Utils.classForName(classPath).newInstance()
+				      registerSource(source.asInstanceOf[Source])
+				    } catch {
+				      case e: Exception => logError("Source class " + classPath + " cannot be instantiated", e)
+				    }
+				  }
+				}
+			从metricsconfig中获取参数
+			匹配driver的properties中以source.开头的属性
+			将每个source的metricregistry注册到concurrentmap
+
+			注册sinks
+			registerSinks;类似registersources
+				private def registerSinks() {
+				    val instConfig = metricsConfig.getInstance(instance)
+				    val sinkConfigs = metricsConfig.subProperties(instConfig, MetricsSystem.SINK_REGEX)
+
+				    sinkConfigs.foreach { kv =>
+				      val classPath = kv._2.getProperty("class")
+				      if (null != classPath) {
+				        try {
+				          val sink = Utils.classForName(classPath)
+				            .getConstructor(classOf[Properties], classOf[MetricRegistry], classOf[SecurityManager])
+				            .newInstance(kv._2, registry, securityMgr)
+				          if (kv._1 == "servlet") {
+				            metricsServlet = Some(sink.asInstanceOf[MetricsServlet])
+				          } else {
+				            sinks += sink.asInstanceOf[Sink]
+				          }
+				        } catch {
+				          case e: Exception =>
+				            logError("Sink class " + classPath + " cannot be instantiated")
+				            throw e
+				        }
+				      }
+				    }
+				  }
+			首先获取参数,然后利用sink_regex正则表达式,获取的配置信息
+			metricsServlet反射得到metricsservlet实例;如果属性的key是servlet,将其设置为 MetricsServlet;如果是sink,加入到[Sink]中
+
+		2.9.3 给sinks增加Jetty的ServeletContextHandler
+			为了在sparkui访问到测量数据,需要给sinks增加jetty的ServeletContextHandler
+			MetricsSystem的 getServletHandler
+				def getServletHandlers: Array[ServletContextHandler] = {
+				  require(running, "Can only call getServletHandlers on a running MetricsSystem")
+				  metricsServlet.map(_.getHandlers(conf)).getOrElse(Array())
+				}
+			调用了metricsServlet的getHandlers;实现方式如下
+				def getHandlers(conf: SparkConf): Array[ServletContextHandler] = {
+				  Array[ServletContextHandler](
+				    createServletHandler(servletPath,
+				      new ServletParams(request => getMetricsSnapshot(request), "text/json"), securityMgr, conf)
+				  )
+				}
+			生成 ServletContextHandler
+
+	2.10 创建和启动 ExecutorAllocationManager
+		ExecutorAllocationManager 用于对已分配的executor进行管理,创建和启动executorallocationmanager
+			SparkContext.scala
+
+			private[spark] def executorAllocationManager: Option[ExecutorAllocationManager] =_executorAllocationManager
+			
+			val dynamicAllocationEnabled = Utils.isDynamicAllocationEnabled(_conf)
+			_executorAllocationManager =
+			  if (dynamicAllocationEnabled) {
+			    schedulerBackend match {
+			      case b: ExecutorAllocationClient =>
+			        Some(new ExecutorAllocationManager(
+			          schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
+			          _env.blockManager.master))
+			      case _ =>
+			        None
+			    }
+			  } else {
+			    None
+			  }
+			_executorAllocationManager.foreach(_.start())
+
+		默认情况下,不会创建 ExecutorAllocationManager; 可以修改属性 isDynamicAllocationEnabled
+		可以设置动态分配最小executor数量,动态分配最大executor数量,每个executor可以运行的task数量等信息
+		start方法将 ExecutorAllocationManager 加入listenerbus中, ExecutorAllocationListener 通过监听 listenerbus 的事件, 动态添加删除executor
+		通过thread不断添加 executor 遍历 executor 将超时的 executor 杀掉并移除
+		ExecutorAllocationManager的实现如下
+			// Polling loop interval (ms)
+			private val intervalMillis: Long = if (Utils.isTesting) {
+			    conf.getLong(TESTING_SCHEDULE_INTERVAL_KEY, 100)
+			  } else {
+			    100
+			  }
+
+		clock
+			// Clock used to schedule when executors should be added and removed
+			private var clock: Clock = new SystemClock()
+		listener
+			// Listener for Spark events that impact the allocation policy
+			val listener = new ExecutorAllocationListener
+
+		start
+			def start(): Unit = {
+			  listenerBus.addToManagementQueue(listener)
+			  val scheduleTask = new Runnable() {
+			    override def run(): Unit = {
+			      try {
+			        schedule()
+			      } catch {
+			        case ct: ControlThrowable =>
+			          throw ct
+			        case t: Throwable =>
+			          logWarning(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
+			      }
+			    }
+			  }
+			  executor.scheduleWithFixedDelay(scheduleTask, 0, intervalMillis, TimeUnit.MILLISECONDS)
+			  client.requestTotalExecutors(numExecutorsTarget, localityAwareTasks, hostToLocalTaskCount)
+			}
+
+
+	2.11 ContextCleaner 的创建和启动
+		ContextCleaner 用于清理那些超出应用范围的 RDD, ShuffleDependency, broadcast等对象
+		由于配置属性 spark.cleaner.ReferenceTracking 默认是true; 所以会构造启动 ContextCleaner
+			private[spark] def cleaner: Option[ContextCleaner] = _cleaner
+			_cleaner =
+			  if (_conf.getBoolean("spark.cleaner.referenceTracking", true)) {
+			    Some(new ContextCleaner(this))
+			  } else {
+			    None
+			  }
+			_cleaner.foreach(_.start())
+
+		追踪到 ContextCleaner 
+			private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
+
+			  /**
+			   * A buffer to ensure that `CleanupTaskWeakReference`s are not garbage collected as long as they
+			   * have not been handled by the reference queue.
+			   */
+			  private val referenceBuffer =
+			    Collections.newSetFromMap[CleanupTaskWeakReference](new ConcurrentHashMap)
+
+			  private val referenceQueue = new ReferenceQueue[AnyRef]
+
+			  private val listeners = new ConcurrentLinkedQueue[CleanerListener]()
+
+			  private val cleaningThread = new Thread() { override def run() { keepCleaning() }}
+
+			  private val periodicGCService: ScheduledExecutorService =
+			    ThreadUtils.newDaemonSingleThreadScheduledExecutor("context-cleaner-periodic-gc")
+		referenceBuffer:缓存AnyRef的虚引用
+		referenceQueue:缓存顶级的AnyRef的引用
+		listeners:监听器数组
+		cleaningThread:用于具体清理工作的线程
+
+		ContextCleaner 和listenerbus一样,监听器模式
+		线程来处理;调用 keepCleaning; ContextCleaner.keepCleaning
+			不断调用remove,clean,来清理
+
+
+	2.12 Spark环境更新
+		SparkContext 初始化中 可能对环境造成影响 所以需要更新环境
+			postEnvironmentUpdate()
+			postApplicationStart()
+				private def postApplicationStart() {
+				    // Note: this code assumes that the task scheduler has been initialized and has contacted
+				    // the cluster manager to get an application ID (in case the cluster manager provides one).
+				    listenerBus.post(SparkListenerApplicationStart(appName, Some(applicationId),
+				      startTime, sparkUser, applicationAttemptId, schedulerBackend.getDriverLogUrls))
+				  }
+
+			其中的jar包和文件的添加如下
+				val addedJarPaths = addedJars.keys.toSeq
+				val addedFilePaths = addedFiles.keys.toSeq
+			->
+				// Used to store a URL for each static file/jar together with the file's local timestamp
+				private[spark] val addedFiles = new ConcurrentHashMap[String, Long]().asScala
+				private[spark] val addedJars = new ConcurrentHashMap[String, Long]().asScala
+			->	
+				_jars = Utils.getUserJars(_conf)
+				_files = _conf.getOption("spark.files").map(_.split(",")).map(_.filter(_.nonEmpty))
+
+			addFile, addJar 都和书中描述不一样了吧
+				// Add each JAR given through the constructor
+				if (jars != null) {
+				  jars.foreach(addJar)
+				}
+
+				if (files != null) {
+				  files.foreach(addFile)
+				}
+			然后可以溯源
+			postEnvironmentUpdate的实现
+				private def postEnvironmentUpdate() {
+				    if (taskScheduler != null) {
+				      val schedulingMode = getSchedulingMode.toString
+				      val addedJarPaths = addedJars.keys.toSeq
+				      val addedFilePaths = addedFiles.keys.toSeq
+				      val environmentDetails = SparkEnv.environmentDetails(conf, schedulingMode, addedJarPaths,
+				        addedFilePaths)
+				      val environmentUpdate = SparkListenerEnvironmentUpdate(environmentDetails)
+				      listenerBus.post(environmentUpdate)
+				    }
+				  }
+			val environmentDetails = SparkEnv.environmentDetails的实现如下:sparkENv.scala
+				def environmentDetails(
+				      conf: SparkConf,
+				      schedulingMode: String,
+				      addedJars: Seq[String],
+				      addedFiles: Seq[String]): Map[String, Seq[(String, String)]] = {
+
+				    import Properties._
+				    val jvmInformation = Seq(
+				      ("Java Version", s"$javaVersion ($javaVendor)"),
+				      ("Java Home", javaHome),
+				      ("Scala Version", versionString)
+				    ).sorted
+
+				    // Spark properties
+				    // This includes the scheduling mode whether or not it is configured (used by SparkUI)
+				    val schedulerMode =
+				      if (!conf.contains("spark.scheduler.mode")) {
+				        Seq(("spark.scheduler.mode", schedulingMode))
+				      } else {
+				        Seq.empty[(String, String)]
+				      }
+				    val sparkProperties = (conf.getAll ++ schedulerMode).sorted
+			SparkContext.postApplicationStart 实现如下
+				private def postApplicationStart() {
+				  // Note: this code assumes that the task scheduler has been initialized and has contacted
+				  // the cluster manager to get an application ID (in case the cluster manager provides one).
+				  listenerBus.post(SparkListenerApplicationStart(appName, Some(applicationId),
+				    startTime, sparkUser, applicationAttemptId, schedulerBackend.getDriverLogUrls))
+				}
+		2.13 创建和启动DAGSchedulerSource, BlockManagerSource
+			创建 DAGSchedulerSource, BlockManagerSource 之前 首先调用 taskscheduler, poststarthook,为了等待backend就绪
+				// Post init
+				_taskScheduler.postStartHook()
+			    _env.metricsSystem.registerSource(_dagScheduler.metricsSource) ->   private[spark] val metricsSource: DAGSchedulerSource = new DAGSchedulerSource(this)
+				_env.metricsSystem.registerSource(new BlockManagerSource(_env.blockManager))
+				_executorAllocationManager.foreach { e =>
+				  _env.metricsSystem.registerSource(e.executorAllocationManagerSource)
+
+			新版本,似乎是取消了 initialDriverMetrics,直接用registersource体现了
+
+			TaskScheduler.scala脚本中, postStartHook的实现是空的
+			TaskSchedulerImpl.scala中,才有 postStartHook 的实现
+				override def postStartHook() {
+				    waitBackendReady()
+				  }
+			然后可以层层追溯了
+
+		2.14 将SparkContext标记为激活
+			SparkContext 初始化最后,是将SparkContext状态从 contextBeingConstructed->activeContext
+				  // In order to prevent multiple SparkContexts from being active at the same time, mark this
+				  // context as having finished construction.
+				  // NOTE: this must be placed at the end of the SparkContext constructor.
+				  SparkContext.setActiveContext(this, allowMultipleContexts)
+				}
+				private[spark] def setActiveContext(
+				      sc: SparkContext,
+				      allowMultipleContexts: Boolean): Unit = {
+				    SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
+				      assertNoOtherContextIsRunning(sc, allowMultipleContexts)
+				      contextBeingConstructed = None
+				      activeContext.set(sc)
+				    }
+				  }
+
+
+		2.15 总结
+			SparkContext的构建
+			Driver->Conf->Context
+			首先是SparkEnv,创造执行环境
+			然后为了保持对所有持久化的RDD的跟踪,使用metadatacleaner;
+			然后构建SparkUI界面
+			要注意,Hadoop和Executor的配置和环境变量
+
+			接着开始创建任务调度器,TaskScheduler
+			创建和启动 DAGScheduler, 有向无环图的调度器
+			启动 TaskScheduler
+			启动测量系统 MetricsSystem
+
+			这就七七八八了
+			然后创建 ExecutorAllocationManager, 分配管理Executor
+			创建ContextCleaner,清理器
+			更新Spark环境,将给定的参数加进去
+			创建 DAGSchedulerSource BlockManagerSource
+			最后将SparkContext标记为激活就可以了
