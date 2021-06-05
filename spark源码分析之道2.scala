@@ -350,3 +350,101 @@
 			这里的 BlockManagerMasterActor 实际上应该是 Rpc了;Actor已经被取消了
 
 			2.3.1 BlockManagerMasterActor
+				BlockManagerMasterActor 只存在于Driver上;Executor从ActorSystem获取BlockManagerMasterActor的引用;
+				然后给BlockManagerMasterActor发送消息,实现和Driver的交互
+				新版本中,BlockManagerMasterActor被 BlockManagerMasterEndpoint替代
+				BlockManagerMasterEndpoint,维护了很多缓存数据结构
+				blockManagerInfo, blockmanagerid和blockmanager的信息
+				blockmanageridbyexecutor, 缓存executorid与其拥有的blockmanagerid之间的映射关系
+				blocklocation,缓存block与blockmanagerid的映射关系
+				
+
+			2.3.2 询问Driver并获取回复方法
+				在Executor的BlockManagerMaster中,所有与Driver上BlockManagerMaster的交互方法最终都调用了askDriverwithReply
+
+			2.3.3 向Blockmanagermaster注册blockmanagerid
+				executor或者driver,本身的blockmanager在初始化时,需要向driver的blockmanager注册blockmanager信息
+
+		2.4 磁盘块管理器
+			2.4.1 DiskBlockManager的构造过程
+				调用createLocalDirs;DiskBlockManager.scala;创建二维数组subdir,用来缓存一级目录localdirs和二级目录
+				二级目录,数量根据配置spark.diskstore.subdirectories获取,默认64
+					private[spark] val subDirsPerLocalDir = conf.getInt("spark.diskStore.subDirectories", 64)
+					private val subDirs = Array.fill(localDirs.length)(new Array[File](subDirsPerLocalDir))
+					private[spark] val localDirs: Array[File] = createLocalDirs(conf)
+					  if (localDirs.isEmpty) {
+					    logError("Failed to create any local dir.")
+					    System.exit(ExecutorExitCode.DISK_STORE_FAILED_TO_CREATE_DIR)
+					  }
+					private def createLocalDirs(conf: SparkConf): Array[File] = {
+					  Utils.getConfiguredLocalDirs(conf).flatMap { rootDir =>
+					    try {
+					      val localDir = Utils.createDirectory(rootDir, "blockmgr")
+					      logInfo(s"Created local directory at $localDir")
+					      Some(localDir)
+					    } catch {
+					      case e: IOException =>
+					        logError(s"Failed to create local dir in $rootDir. Ignoring this directory.", e)
+					        None
+					    }
+					  }
+					}
+				添加运行时环境结束时的钩子,用于在进程关闭时创建线程;通过调用DiskBlockManager的stop方法,清除一些临时目录
+					private def addShutdownHook(): AnyRef = {
+					  logDebug("Adding shutdown hook") // force eager creation of logger
+					  ShutdownHookManager.addShutdownHook(ShutdownHookManager.TEMP_DIR_SHUTDOWN_PRIORITY + 1) { () =>
+					    logInfo("Shutdown hook called")
+					    DiskBlockManager.this.doStop()
+					  }
+					}
+					/** Cleanup local dirs and stop shuffle sender. */
+					private[spark] def stop() {
+					  // Remove the shutdown hook.  It causes memory leaks if we leave it around.
+					  try {
+					    ShutdownHookManager.removeShutdownHook(shutdownHook)
+					  } catch {
+					    case e: Exception =>
+					      logError(s"Exception while removing shutdown hook.", e)
+					  }
+					  doStop()
+					}
+				DiskBlockManager为什么要创建二级目录结构?这是因为二级目录,用于对文件进行散列存储;散列存储可以使得所有文件都随机存放,写入删除更快
+
+			2.4.2 获取磁盘文件方法 getFile
+				getFile方法,获取磁盘文件
+					/** Looks up a file by hashing it into one of our local subdirectories. */
+					// This method should be kept in sync with
+					// org.apache.spark.network.shuffle.ExternalShuffleBlockResolver#getFile().
+					def getFile(filename: String): File = {
+					  // Figure out which local directory it hashes to, and which subdirectory in that
+					  val hash = Utils.nonNegativeHash(filename)
+					  val dirId = hash % localDirs.length
+					  val subDirId = (hash / localDirs.length) % subDirsPerLocalDir
+					  // Create the subdirectory if it doesn't already exist
+					  val subDir = subDirs(dirId).synchronized {
+					    val old = subDirs(dirId)(subDirId)
+					    if (old != null) {
+					      old
+					    } else {
+					      val newDir = new File(localDirs(dirId), "%02x".format(subDirId))
+					      if (!newDir.exists() && !newDir.mkdir()) {
+					        throw new IOException(s"Failed to create local dir in $newDir.")
+					      }
+					      subDirs(dirId)(subDirId) = newDir
+					      newDir
+					    }
+					  }
+				计算hash值;->根据hash值,与本地文件一级目录总数,求余数;记dirId;->hash值与本地文件一级目录总数求商数,此商数与二级目录数目求余数
+				如果 dirId/subDirId目录存在,则获取dirId/subDirId目录下的文件,否则新建 dirId/subDirId 目录
+			2.4.3 创建临时 Block 方法,createTempShuffleBlock
+				当shuffleMapTask运行结束时,需要把中间结果临时保存;此时,调用 createTempShuffleBlock,作为临时Block,返回TempShuffleBlockId与其文件的对偶
+					def createTempShuffleBlock(): (TempShuffleBlockId, File) = {
+					  var blockId = new TempShuffleBlockId(UUID.randomUUID())
+					  while (getFile(blockId).exists()) {
+					    blockId = new TempShuffleBlockId(UUID.randomUUID())
+					  }
+					  (blockId, getFile(blockId))
+					}
+
+		2.5 磁盘存储DiskStore
+			当MemoryStore没有足够空间,会使用DiskStore,存入磁盘;DiskStore集成BlockStore,实现了getBytes,putBytes,putArray,putIterator等
