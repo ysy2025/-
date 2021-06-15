@@ -455,4 +455,118 @@
 			3.5.2 NIO写入方法putBytes
 				putBytes 方法的作用,是通过DiskBlockManager的getFile方法,获取文件;然后使用NIO的channel将ByteBuffer写入文件
 
-			3.5.3 
+			3.5.3 数组写入方法 putArray
+			3.5.4 Iterator写入方法 putIterator
+		3.6 内存存储 MemoryStore
+			内存存储负责将没有序列化的Java对象数组或者序列化的ByteBuffer存储到内存中
+				private[spark] class MemoryStore(
+				    conf: SparkConf,
+				    blockInfoManager: BlockInfoManager,
+				    serializerManager: SerializerManager,
+				    memoryManager: MemoryManager,
+				    blockEvictionHandler: BlockEvictionHandler)
+				  extends Logging {
+
+				  // Note: all changes to memory allocations, notably putting blocks, evicting blocks, and
+				  // acquiring or releasing unroll memory, must be synchronized on `memoryManager`!
+
+				  private val entries = new LinkedHashMap[BlockId, MemoryEntry[_]](32, 0.75f, true)
+
+				  // A mapping from taskAttemptId to amount of memory used for unrolling a block (in bytes)
+				  // All accesses of this map are assumed to have manually synchronized on `memoryManager`
+				  private val onHeapUnrollMemoryMap = mutable.HashMap[Long, Long]()
+				  // Note: off-heap unroll memory is only used in putIteratorAsBytes() because off-heap caching
+				  // always stores serialized values.
+				  private val offHeapUnrollMemoryMap = mutable.HashMap[Long, Long]()
+
+				  // Initial memory to request before unrolling any block
+				  private val unrollMemoryThreshold: Long =
+				    conf.getLong("spark.storage.unrollMemoryThreshold", 1024 * 1024)
+
+				  /** Total amount of memory available for storage, in bytes. */
+				  private def maxMemory: Long = {
+				    memoryManager.maxOnHeapStorageMemory + memoryManager.maxOffHeapStorageMemory
+				  }
+
+				  if (maxMemory < unrollMemoryThreshold) {
+				    logWarning(s"Max memory ${Utils.bytesToString(maxMemory)} is less than the initial memory " +
+				      s"threshold ${Utils.bytesToString(unrollMemoryThreshold)} needed to store a block in " +
+				      s"memory. Please configure Spark with more memory.")
+				  }
+
+				  logInfo("MemoryStore started with capacity %s".format(Utils.bytesToString(maxMemory)))
+
+				  /** Total storage memory used including unroll memory, in bytes. */
+				  private def memoryUsed: Long = memoryManager.storageMemoryUsed
+
+				  /**
+				   * Amount of storage memory, in bytes, used for caching blocks.
+				   * This does not include memory used for unrolling.
+				   */
+				  private def blocksMemoryUsed: Long = memoryManager.synchronized {
+				    memoryUsed - currentUnrollMemory
+				  }
+			MaxMemory = currentMemory + freeMemory
+					  = currentMemory + maxUnrollMemory + otherMemory
+					  = currentMemory + currentUnrollMemory + freeUnrollMemory + otherMemory
+			3.6.1 putBytes
+				老版本里面,要求序列化判断:如果Block可以被反序列化,即序列化Block然后putIterator;否则trytoput
+				新版本中,脚本如下
+					def putBytes[T: ClassTag](
+					      blockId: BlockId,
+					      size: Long,
+					      memoryMode: MemoryMode,
+					      _bytes: () => ChunkedByteBuffer): Boolean = {
+					    require(!contains(blockId), s"Block $blockId is already present in the MemoryStore")
+					    if (memoryManager.acquireStorageMemory(blockId, size, memoryMode)) {
+					      // We acquired enough memory for the block, so go ahead and put it
+					      val bytes = _bytes()
+					      assert(bytes.size == size)
+					      val entry = new SerializedMemoryEntry[T](bytes, memoryMode, implicitly[ClassTag[T]])
+					      entries.synchronized {
+					        entries.put(blockId, entry)
+					      }
+					      logInfo("Block %s stored as bytes in memory (estimated size %s, free %s)".format(
+					        blockId, Utils.bytesToString(size), Utils.bytesToString(maxMemory - blocksMemoryUsed)))
+					      true
+					    } else {
+					      false
+					    }
+				首先判断,是否获取了storage的Memory;如果获得了:
+					获取字节数;
+					序列化;
+					put
+			3.6.2 Iterator 写入方法,putIterator详解
+				新版本不同于老版本了
+private[storage] def putIteratorAsValues[T](
+      blockId: BlockId,
+      values: Iterator[T],
+      classTag: ClassTag[T]): Either[PartiallyUnrolledIterator[T], Long] = {
+	//首先初始化参数
+	//申请内存,以开始展开内存
+	keepUnrolling = reserveUnrollMemoryForThisTask(blockId, initialMemoryThreshold, MemoryMode.ON_HEAP)
+	
+	//如果一直在展开:
+		warning
+	//如果不是一直在展开:
+		this block 占据的展开的内存 += initialMemoryThreshold
+
+	//展开block,定期检查是否超过了threshold
+	while (values.hasNext && keepUnrolling) {
+	      vector += values.next()
+	      if (elementsUnrolled % memoryCheckPeriod == 0) {
+	        // If our vector's size has exceeded the threshold, request more memory
+	        val currentSize = vector.estimateSize()
+	        if (currentSize >= memoryThreshold) {
+	          val amountToRequest = (currentSize * memoryGrowthFactor - memoryThreshold).toLong
+	          keepUnrolling =
+	            reserveUnrollMemoryForThisTask(blockId, amountToRequest, MemoryMode.ON_HEAP)
+	          if (keepUnrolling) {
+	            unrollMemoryUsedByThisBlock += amountToRequest
+	          }
+	          // New threshold is currentSize * memoryGrowthFactor
+	          memoryThreshold += amountToRequest
+	        }
+	      }
+	      elementsUnrolled += 1
+	    }
