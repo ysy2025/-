@@ -265,7 +265,7 @@
 					      .addLast("handler", channelHandler);
 					    ...
 
-			2.2.5 获取线程shuffle文件
+			3.2.5 获取线程shuffle文件
 				NettyBlockTransferService 的fetchBlocks 方法 用于获取远程 shuffle文件 实际上利用了 NettyBlockTransferService中创建的Netty服务
 					override def fetchBlocks(
 					    host: String,
@@ -299,7 +299,7 @@
 					}
 				实现方法,NettyBlockTransferService.fetchBlocks
 
-			2.2.6 上传 shuffle文件
+			3.2.6 上传 shuffle文件
 				NettyBlockTransferService 的uploadblock 实际上用于上传shuffle文件到远程executor
 				利用了 NettyBlockTransferService
 					override def uploadBlock(
@@ -342,14 +342,14 @@
 					可以作为stream,将数据上传;也可以转化成nio buffer,上传
 					都是通过client上传的;stream时,uploadStream;bufferarray时,sendRpc
 
-		2.3 BlockManagerMaster 对于 BlockManager的管理
+		3.3 BlockManagerMaster 对于 BlockManager的管理
 			Driver上的 BlockManagerMaster, 对于存在Executor上面的BlockManager,统一管理
 			但是如果 Driver和Executor 位于不同机器时,如何是好?
 			Driver的BlockManagerMaster 会持有 BlockManagerMasterActor, 所有executor也会从ActorSystem中获取 BlockManagerMasterActor的引用
 			所有 Executor 和Driver 关于BlockManager的交互都依赖它
 			这里的 BlockManagerMasterActor 实际上应该是 Rpc了;Actor已经被取消了
 
-			2.3.1 BlockManagerMasterActor
+			3.3.1 BlockManagerMasterActor
 				BlockManagerMasterActor 只存在于Driver上;Executor从ActorSystem获取BlockManagerMasterActor的引用;
 				然后给BlockManagerMasterActor发送消息,实现和Driver的交互
 				新版本中,BlockManagerMasterActor被 BlockManagerMasterEndpoint替代
@@ -359,14 +359,14 @@
 				blocklocation,缓存block与blockmanagerid的映射关系
 				
 
-			2.3.2 询问Driver并获取回复方法
+			3.3.2 询问Driver并获取回复方法
 				在Executor的BlockManagerMaster中,所有与Driver上BlockManagerMaster的交互方法最终都调用了askDriverwithReply
 
-			2.3.3 向Blockmanagermaster注册blockmanagerid
+			3.3.3 向Blockmanagermaster注册blockmanagerid
 				executor或者driver,本身的blockmanager在初始化时,需要向driver的blockmanager注册blockmanager信息
 
-		2.4 磁盘块管理器
-			2.4.1 DiskBlockManager的构造过程
+		3.4 磁盘块管理器
+			3.4.1 DiskBlockManager的构造过程
 				调用createLocalDirs;DiskBlockManager.scala;创建二维数组subdir,用来缓存一级目录localdirs和二级目录
 				二级目录,数量根据配置spark.diskstore.subdirectories获取,默认64
 					private[spark] val subDirsPerLocalDir = conf.getInt("spark.diskStore.subDirectories", 64)
@@ -410,7 +410,7 @@
 					}
 				DiskBlockManager为什么要创建二级目录结构?这是因为二级目录,用于对文件进行散列存储;散列存储可以使得所有文件都随机存放,写入删除更快
 
-			2.4.2 获取磁盘文件方法 getFile
+			3.4.2 获取磁盘文件方法 getFile
 				getFile方法,获取磁盘文件
 					/** Looks up a file by hashing it into one of our local subdirectories. */
 					// This method should be kept in sync with
@@ -436,7 +436,7 @@
 					  }
 				计算hash值;->根据hash值,与本地文件一级目录总数,求余数;记dirId;->hash值与本地文件一级目录总数求商数,此商数与二级目录数目求余数
 				如果 dirId/subDirId目录存在,则获取dirId/subDirId目录下的文件,否则新建 dirId/subDirId 目录
-			2.4.3 创建临时 Block 方法,createTempShuffleBlock
+			3.4.3 创建临时 Block 方法,createTempShuffleBlock
 				当shuffleMapTask运行结束时,需要把中间结果临时保存;此时,调用 createTempShuffleBlock,作为临时Block,返回TempShuffleBlockId与其文件的对偶
 					def createTempShuffleBlock(): (TempShuffleBlockId, File) = {
 					  var blockId = new TempShuffleBlockId(UUID.randomUUID())
@@ -446,5 +446,13 @@
 					  (blockId, getFile(blockId))
 					}
 
-		2.5 磁盘存储DiskStore
+		3.5 磁盘存储DiskStore
 			当MemoryStore没有足够空间,会使用DiskStore,存入磁盘;DiskStore集成BlockStore,实现了getBytes,putBytes,putArray,putIterator等
+			diskStore.scala
+			3.5.1 NIO读取方法 GetBytes
+				通过DiskBlockManager的getFile方法获取文件 然后使用NIO将文件读取到ByteBuffer中
+
+			3.5.2 NIO写入方法putBytes
+				putBytes 方法的作用,是通过DiskBlockManager的getFile方法,获取文件;然后使用NIO的channel将ByteBuffer写入文件
+
+			3.5.3 
