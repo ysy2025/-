@@ -538,35 +538,102 @@
 					put
 			3.6.2 Iterator 写入方法,putIterator详解
 				新版本不同于老版本了
-private[storage] def putIteratorAsValues[T](
-      blockId: BlockId,
-      values: Iterator[T],
-      classTag: ClassTag[T]): Either[PartiallyUnrolledIterator[T], Long] = {
-	//首先初始化参数
-	//申请内存,以开始展开内存
-	keepUnrolling = reserveUnrollMemoryForThisTask(blockId, initialMemoryThreshold, MemoryMode.ON_HEAP)
-	
-	//如果一直在展开:
-		warning
-	//如果不是一直在展开:
-		this block 占据的展开的内存 += initialMemoryThreshold
+				private[storage] def putIteratorAsValues[T](
+				      blockId: BlockId,
+				      values: Iterator[T],
+				      classTag: ClassTag[T]): Either[PartiallyUnrolledIterator[T], Long] = {
+					//首先初始化参数
+					//申请内存,以开始展开内存
+					keepUnrolling = reserveUnrollMemoryForThisTask(blockId, initialMemoryThreshold, MemoryMode.ON_HEAP)
+					
+					//如果一直在展开:
+						warning
+					//如果不是一直在展开:
+						this block 占据的展开的内存 += initialMemoryThreshold
 
-	//展开block,定期检查是否超过了threshold
-	while (values.hasNext && keepUnrolling) {
-	      vector += values.next()
-	      if (elementsUnrolled % memoryCheckPeriod == 0) {
-	        // If our vector's size has exceeded the threshold, request more memory
-	        val currentSize = vector.estimateSize()
-	        if (currentSize >= memoryThreshold) {
-	          val amountToRequest = (currentSize * memoryGrowthFactor - memoryThreshold).toLong
-	          keepUnrolling =
-	            reserveUnrollMemoryForThisTask(blockId, amountToRequest, MemoryMode.ON_HEAP)
-	          if (keepUnrolling) {
-	            unrollMemoryUsedByThisBlock += amountToRequest
-	          }
-	          // New threshold is currentSize * memoryGrowthFactor
-	          memoryThreshold += amountToRequest
-	        }
-	      }
-	      elementsUnrolled += 1
-	    }
+					//展开block,定期检查是否超过了threshold
+					while (values.hasNext && keepUnrolling) {
+					      vector += values.next()
+					      if (elementsUnrolled % memoryCheckPeriod == 0) {
+					        // If our vector's size has exceeded the threshold, request more memory
+					        val currentSize = vector.estimateSize()
+					        if (currentSize >= memoryThreshold) {
+					          val amountToRequest = (currentSize * memoryGrowthFactor - memoryThreshold).toLong
+					          keepUnrolling =
+					            reserveUnrollMemoryForThisTask(blockId, amountToRequest, MemoryMode.ON_HEAP)
+					          if (keepUnrolling) {
+					            unrollMemoryUsedByThisBlock += amountToRequest
+					          }
+					          // New threshold is currentSize * memoryGrowthFactor
+					          memoryThreshold += amountToRequest
+					        }
+					      }
+					      elementsUnrolled += 1
+					    }
+			3.6.3 安全展开方法 unrollSafely;这一部分在putIterator中融合起来了
+				为了防止写入内存数据过大,导致内存溢出:在正式写入内存之前,先用逻辑方式申请内存;申请成功,才写入;称为安全展开.
+					elementsUnrolled = 展开的元素数量
+					initialMemoryThreshold = 每个线程用来展开Block的初始内存阈值
+					memoryCheckPeriod = 多次展开内存后,判断是否需要申请更多内存
+					memoryThreshold = 当前线程保留的用于特殊展开操作的内存阈值
+					memoryGrowthFactor = 内存请求因子
+					previousMemoryThreshold = 之前当前线程已经展开的驻留的内存大小;当前线程增加的展开内存,最后会被释放
+					vector = 跟踪展开内存信息
+					maxUnrollMemory = 当前Driver或者Executor最多展开的Block占用的内存
+					maxMemory = 当前Driver或者Executor的最大内存
+					currentMemory = 当前Driver或者Executor已经使用的内存
+					freeMemory = 当前Driver或者Executor未使用的内存
+					currentUnrollMemory = unrollMemoryMap中,所有展开的block的内存和;当前Driver或者Executor所有线程展开的block的内存和
+					unrollMemoryMap = 当前Driver或者Executor中所有线程展开的Block都存入此Map中;key=线程id,value=内存大小和
+					currentSize = vector中跟踪的对象的总大小
+					keepUnrolling = 标记是否有足够的内存来展开Block = freeMemory > currentUnrollMemory + memory(要分配的内存)
+
+				展开内存的步骤
+					申请 memoryThreshold的初始大小为 initialMemoryThreshold
+					如果 Iterator[Any]中有元素,而且 keepUnrolling, 向vector中添加 Iterator[Any], elementsUnrolled += 1;反之跳步骤4
+					如果 elementsUnrolled % memoryCheckPeriod == 0
+						检查currentSize 是否 大于 memoryThreshold?大于
+							申请内存;
+							如果申请失败,但是 maxUnrollMemory > currentUnrollMemory->释放内存
+						小于:
+							不管
+					根据是否将block完整放入内存,以数组或者迭代器形式返回vector数据
+					最后,计算本次展开块实际占用的空间,amountToRelease,更新unrollMemoryMap中当前线程的内存大小
+
+				unrollSafely 多次使用 reserveUnrollMemoryForThisTask, 以便给当前线程申请逻辑内存
+					def reserveUnrollMemoryForThisTask(
+					      blockId: BlockId,
+					      memory: Long,
+					      memoryMode: MemoryMode): Boolean = {
+					    memoryManager.synchronized {
+					      val success = memoryManager.acquireUnrollMemory(blockId, memory, memoryMode)
+					      if (success) {
+					        val taskAttemptId = currentTaskAttemptId()
+					        val unrollMemoryMap = memoryMode match {
+					          case MemoryMode.ON_HEAP => onHeapUnrollMemoryMap
+					          case MemoryMode.OFF_HEAP => offHeapUnrollMemoryMap
+					        }
+					        unrollMemoryMap(taskAttemptId) = unrollMemoryMap.getOrElse(taskAttemptId, 0L) + memory
+					      }
+					      success
+					    }
+					  }
+				首先获取unroll的内存大小;
+				如果unroll的内存非空:
+					获取id
+					根据memorymode,判断
+				然后,申请逻辑内存
+
+			3.6.4 确认空闲内存方法 ensureFreeSpace
+				ensureFreeSpace 确认是否有足够内存,if 不足,会释放被 MemoryEntry占用的内存
+				变量:
+					actualFreeMemory = 实际空闲的内存 = actualFreeMemory - currentUnrollMemory
+					selectedBlocks = 已经选择要从内存中腾出的Block对应的BlockId的数组
+					space = 需要腾出的内存大小
+					entries = 用于存放Block
+					blockIdToAdd = 将要添加的Block对应的blockId
+				实现:
+					space !> maxMemory
+					如果 actualFreeMemory >= space, 说明内存足够;不用释放内存空间直接返回
+					如果 actualFreeMemory + selectedMemory < space, 迭代 entries, 获得blockId
+					actualFreeMemory + selectedMemory 大于等于 space, 说明可以腾出空间
