@@ -637,3 +637,124 @@
 					如果 actualFreeMemory >= space, 说明内存足够;不用释放内存空间直接返回
 					如果 actualFreeMemory + selectedMemory < space, 迭代 entries, 获得blockId
 					actualFreeMemory + selectedMemory 大于等于 space, 说明可以腾出空间
+					
+			3.6.5 内存写入方法 putArray
+				内存写入方法 putArray 首先对对象大小进行估算，然后写入内存
+				如果 unrollSafely 返回的数据 匹配Left,arrayValues, 说明整个block可以一次性放入内存->调用putArray
+				sizeestimator.estimate 用来估算对象大小,遍历对象和属性
+
+			3.6.6 尝试写入内存方法 trytoPut
+				block不支持序列化时,调用 tryToPut 方法
+
+			3.6.7 获取内存数据方法 GetBytes
+				从entries中获取memoryentry;如果 memoryentry 支持反序列化=>value反序列化后返回,否则对 memoryentry 的value复制后返回
+					def getBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
+					  val entry = entries.synchronized { entries.get(blockId) }
+					  entry match {
+					    case null => None
+					    case e: DeserializedMemoryEntry[_] =>
+					      throw new IllegalArgumentException("should only call getBytes on serialized blocks")
+					    case SerializedMemoryEntry(bytes, _, _) => Some(bytes)
+					  }
+					}
+			3.6.8 获取数据方法 getValues
+			从内存中获取数据 从entries中获取memoryentry;并将blockid和value返回
+				def getValues(blockId: BlockId): Option[Iterator[_]] = {
+				  val entry = entries.synchronized { entries.get(blockId) }
+				  entry match {
+				    case null => None
+				    case e: SerializedMemoryEntry[_] =>
+				      throw new IllegalArgumentException("should only call getValues on deserialized blocks")
+				    case DeserializedMemoryEntry(values, _, _) =>
+				      val x = Some(values)
+				      x.map(_.iterator)
+				  }
+				}
+
+		3.7 Tachyon 存储 TachyonStore
+			为啥要用 Tachyon?
+				spark的基于HDFS的文件系统是基于磁盘的,读写效率低下;
+				spark的计算引擎和存储体系,都位于executor的同一进程中,if计算挂了,存储体系缓存的数据也会挂
+				不同的spark,任务可能访问同样的数据;重复加载,导致数据对象过多,GC时间过长
+			3.7,1 Tachyon
+				Tachyon 是位于现有大数据计算框架和大数据存储系统之间的独立一层
+
+				Tachyon 采用 master-worker架构;支持zk进行容错,用zk管理文件的元数据信息;监控各个taychon worker的状态
+				每个tachyon worker启动一个守护进程,管理本地ramdisk
+				ramdisk实际上是tachyon集群的内存部分
+				tachyon采用和spark类似的RDD的操作,利用lineage,和异步记录的checkpoint来恢复数据
+			3.7.2 TachyonStore的使用
+				Spark源码自带的SparkTachyonHdfsLR
+				不过现在2.4.7版本中已经几乎找不到Tachyon的痕迹了.pass
+
+		3.8 块管理器 BlockManager
+			3.8.1 移出内存方法 dropFromMemory
+				内存不足的时候,需要腾出部分内存空间 dropFromMemory 实现了这个功能; spark.storage.BlockManager.scala
+				1,从blockinfo中检查,是否存在需要迁移的blockid->如果存在,从blockinfo中获取block的storagelevel
+				2,if StorageLevel 允许存入内存,且 diskstore 中不存在此文件;调用 putarray或者putbytes方法,存到硬盘中
+				3,从memorystore清除blockid对应的block
+				4,使用 getcurrentblockstatus 方法获取block的最新状态 if此block的tellmaster未true,调用reportblockstatus方法,给blockmanagermasteractor报告状态
+
+			3.8.2 状态报告方法 reportblockstatus
+				private def reportBlockStatus(
+				      blockId: BlockId,
+				      status: BlockStatus,
+				      droppedMemorySize: Long = 0L): Unit = {
+				    val needReregister = !tryToReportBlockStatus(blockId, status, droppedMemorySize)
+				    if (needReregister) {
+				      logInfo(s"Got told to re-register updating block $blockId")
+				      // Re-registering will report our new block for free.
+				      asyncReregister()
+				    }
+				    logDebug(s"Told master about block $blockId")
+				  }
+				reportBlockStatus 用于向 BlockManagerMasterActor 报告 block的状态,并重新注册blockmanager
+				首先调用 tryToReportBlockStatus, 发送消息更新block的情况,内存大小,磁盘大小, 存储级别
+				if blockmanager没有向 BlockManagerMasterActor 注册, 调用 asyncReregister 来注册;
+				updateBlockStatus, 
+					def updateBlockInfo(
+					    blockManagerId: BlockManagerId,
+					    blockId: BlockId,
+					    storageLevel: StorageLevel,
+					    memSize: Long,
+					    diskSize: Long): Boolean = {
+					  val res = driverEndpoint.askSync[Boolean](
+					    UpdateBlockInfo(blockManagerId, blockId, storageLevel, memSize, diskSize))
+					  logDebug(s"Updated info of block $blockId")
+					  res
+					}
+				调用了asksync方法
+
+			3.8.3 单对象块的写入方法 putSingle
+				def putSingle[T: ClassTag](
+				    blockId: BlockId,
+				    value: T,
+				    level: StorageLevel,
+				    tellMaster: Boolean = true): Boolean = {
+				  putIterator(blockId, Iterator(value), level, tellMaster)
+				}
+				def putIterator[T: ClassTag](
+				    blockId: BlockId,
+				    values: Iterator[T],
+				    level: StorageLevel,
+				    tellMaster: Boolean = true): Boolean = {
+				  require(values != null, "Values is null")
+				  doPutIterator(blockId, () => values, level, implicitly[ClassTag[T]], tellMaster) match {
+				    case None =>
+				      true
+				    case Some(iter) =>
+				      // Caller doesn't care about the iterator values, so we can close the iterator here
+				      // to free resources earlier
+				      iter.close()
+				      false
+				  }
+				}
+				将单一对象构成的block写入存储系统,putsingle经过层层调用,实际调用了 doPutIterator 方法
+
+			3.8.4 序列化字节快写入方法 putBytes
+				用于将 序列化字节组成的 block写入存储系统;
+				实际调用了doputbytes 方法
+
+			3.8.5 doputbytes 方法
+
+
