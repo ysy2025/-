@@ -756,5 +756,37 @@
 				实际调用了doputbytes 方法
 
 			3.8.5 doputbytes 方法
+				书中的处理流程讲的很清楚了;见截图
+				答题上,先判断是否存在blockinfo缓存;
+				然后判断是否使用内存;
+				然后判断是否使用Tachyon;
+				然后判断是否使用磁盘;
+				最后抛出异常.
+			3.8.6 数据块备份方法 replicate
+				BlockManager.scala 中 replicate方法,复制备份数据块
+				maxReplicationFailures = 最大复制失败次数
+				numPeersToReplicateTo = 需要复制的备份数
+				peersForReplication = 可以作为备份的BlockManager的缓存
+				peersReplicatedTo = 已经作为备份的BlockManager的缓存
+				peersFailedToReplicateTo = 已经复制失败的BlockManager的缓存
+				numFailures = 失败次数
+				done = 复制是否完成
 
+				为了容灾, peersForReplication 中缓存的BlockManager 不应该是当前的BlockManager;
+				获取其他所有BlockManager的方法是 getPeers
+					private def getPeers(forceFetch: Boolean): Seq[BlockManagerId] = {
+					  peerFetchLock.synchronized {
+					    val cachedPeersTtl = conf.getInt("spark.storage.cachedPeersTtl", 60 * 1000) // milliseconds
+					    val timeout = System.currentTimeMillis - lastPeerFetchTime > cachedPeersTtl
+					    if (cachedPeers == null || forceFetch || timeout) {
+					      cachedPeers = master.getPeers(blockManagerId).sortBy(_.hashCode)
+					      lastPeerFetchTime = System.currentTimeMillis
+					      logDebug("Fetched peers from master: " + cachedPeers.mkString("[", ",", "]"))
+					    }
+					    cachedPeers
+					  }
+					}
 
+					cachedPeersTtl = 当前BlockManager 缓存的BlockManagerId
+					cachedPeers = 缓存的超时时间, 默认60s
+					forceFetch = 是否强制从 BlockManagerMasterActor 获取最新的 BlockManagerId
