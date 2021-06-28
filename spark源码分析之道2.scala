@@ -825,3 +825,93 @@
 					  val future = uploadBlock(hostname, port, execId, blockId, blockData, level, classTag)
 					  ThreadUtils.awaitResult(future, Duration.Inf)
 					}
+				3.8.7 创建 DiskBlockObjectWriter 的方法 getDiskWriter,获得磁盘的writer
+					getDiskWriter 用于创建DiskBlockObjectWriter; spark.shuffle.sync决定写操作是同步还是异步
+							def getDiskWriter(
+								 blockId: BlockId,
+								 file: File,
+								 serializerInstance: SerializerInstance,
+								 bufferSize: Int,
+								 writeMetrics: ShuffleWriteMetrics): DiskBlockObjectWriter = {
+								val syncWrites = conf.getBoolean("spark.shuffle.sync", false)
+								new DiskBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,
+									syncWrites, writeMetrics, blockId)
+							}
+				3.8.8 获取本地Block的数据方法 getBlockData
+					从本地获取Block的数据
+						override def getBlockData(blockId: BlockId): ManagedBuffer = {
+							if (blockId.isShuffle) {
+								shuffleManager.shuffleBlockResolver.getBlockData(blockId.asInstanceOf[ShuffleBlockId])
+							} else {
+								getLocalBytes(blockId) match {
+									case Some(blockData) =>
+										new BlockManagerManagedBuffer(blockInfoManager, blockId, blockData, true)
+									case None =>
+										// If this block manager receives a request for a block that it doesn't have then it's
+										// likely that the master has outdated block statuses for this block. Therefore, we send
+										// an RPC so that this block is marked as being unavailable from this block manager.
+										reportBlockStatus(blockId, BlockStatus.empty)
+										throw new BlockNotFoundException(blockId.toString)
+								}
+							}
+						}
+					如果 Block是shufflemaptask的输出,那么多个partition的中间结果都写入了同一个文件,怎么样兑取不同partition的中间结果?
+					用ShuffleBlockResolver.getBlockData方法解决此问题
+					如果 Block不是suffle的结果,是resulttask的结果,用getlocalbytes来获取本地中间结果数据
+						如果是BlockData-> BlockManagerManagedBuffer
+						如果是None -> reportBlockStatus,报告Block状态,报错
+
+				3.8.9 获取本地shuffle数据方法 本地result,不是shufflemaptask,窄依赖的结果
+					reduce与map属于同一节点,无需宽依赖,只要调用getlocalBytes即可
+					而getLocalBytes
+						如果blockid是shuffle的,用shuffleManager.shuffleBlockResolver.getBlockData来获取BlockData
+						如果不是shuffle的,是窄依赖,最终通过doGetLocalBytes来获取本地Bytes
+					而 doGetLocalBytes
+						如果 Block允许使用内存,则调用 MemoryStore的getValues或者getBytes方法获取
+						如果 Block允许使用DiskStore,则调用DiskStore的getBytes方法获取
+
+
+					3.8.10 获取远程BLock的数据方法 doGetRemote->新版本的BlockManager.getRemoteBytes方法
+						参数 runningFailureCount = 运行中失败次数
+								 totalFailureCount = 全部失败次数
+									locations = 位置
+									maxFetchFailures = 允许最大失败次数
+									locationIterator = 位置迭代器
+						当location有next
+							loc = 获取next的值
+								blockTransferService.fetchBlockSync获取loc的内部值
+							如果报错了怎么办?
+								xxx
+
+					3.8.11 获取Block数据方法get
+						def get[T: ClassTag](blockId: BlockId): Option[BlockResult] = {
+							val local = getLocalValues(blockId)
+							if (local.isDefined) {
+								logInfo(s"Found block $blockId locally")
+								return local
+							}
+							val remote = getRemoteValues[T](blockId)
+							if (remote.isDefined) {
+								logInfo(s"Found block $blockId remotely")
+								return remote
+							}
+							None
+						}
+						首先,尝试从本地获取,如果没有,才去远程获取
+
+					3.8.12 数据流序列化方法 dataSerializeStream
+						如果写入存储体系的数据本身就序列化了,那么读取时要反序列化
+						dataSerializeStream,使用compressionCodec对文件输入流进行压缩和序列化处理
+						spark.serializer.SerializerManager.dataSerializeStream
+							def dataSerializeWithExplicitClassTag(
+								 blockId: BlockId,
+								 values: Iterator[_],
+								 classTag: ClassTag[_]): ChunkedByteBuffer = {
+								val bbos = new ChunkedByteBufferOutputStream(1024 * 1024 * 4, ByteBuffer.allocate)
+								val byteStream = new BufferedOutputStream(bbos)
+								val autoPick = !blockId.isInstanceOf[StreamBlockId]
+								val ser = getSerializer(classTag, autoPick).newInstance()
+								ser.serializeStream(wrapForCompression(blockId, byteStream)).writeAll(values).close()
+								bbos.toChunkedByteBuffer
+							}
+					其中,wrapForCompression,spark.serializer.SerializerManager.dataSerializeStream下面的方法
