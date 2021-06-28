@@ -773,12 +773,13 @@
 				done = 复制是否完成
 
 				为了容灾, peersForReplication 中缓存的BlockManager 不应该是当前的BlockManager;
-				获取其他所有BlockManager的方法是 getPeers
+				获取其他所有BlockManager的方法是 getPeers; spark.storage.BlockManager类
 					private def getPeers(forceFetch: Boolean): Seq[BlockManagerId] = {
 					  peerFetchLock.synchronized {
 					    val cachedPeersTtl = conf.getInt("spark.storage.cachedPeersTtl", 60 * 1000) // milliseconds
 					    val timeout = System.currentTimeMillis - lastPeerFetchTime > cachedPeersTtl
 					    if (cachedPeers == null || forceFetch || timeout) {
+					    // master = BlockManagerMaster
 					      cachedPeers = master.getPeers(blockManagerId).sortBy(_.hashCode)
 					      lastPeerFetchTime = System.currentTimeMillis
 					      logDebug("Fetched peers from master: " + cachedPeers.mkString("[", ",", "]"))
@@ -790,3 +791,37 @@
 					cachedPeersTtl = 当前BlockManager 缓存的BlockManagerId
 					cachedPeers = 缓存的超时时间, 默认60s
 					forceFetch = 是否强制从 BlockManagerMasterActor 获取最新的 BlockManagerId
+				当 cachedPeers 为空或者forceFetch=true,或者当前时间超时了,则会调用 BlockManagerMaster的 getPeers 方法 从BlockManagerMasterActor 获取最新的 BlockManagerId
+					def getPeers(blockManagerId: BlockManagerId): Seq[BlockManagerId] = {
+					  driverEndpoint.askSync[Seq[BlockManagerId]](GetPeers(blockManagerId))
+					}
+				getPeers调用了askSync
+				BlockManagerMasterEndpoint,替代了 BlockManagerMasterMaster;
+				它的匹配 GetPeers 消息,将执行getPeer方法,从 BlockManagerInfo中,过滤掉 Driver的 BlockManager, 和当前的 BlockManager, 将其余的 BlockManagerId 返回
+
+				replicate 方法,首先获取 BlockManagerId,并且保证再同一个节点上多次尝试复制同一个Block,保证它始终被复制到同一批节点上.
+				当失败,再次尝试时,强制从BlockManagerMasterActor获取最新的BlockManagerId,并且从 peersForReplication 排除 peersReplicatedTo 和 peersFailedToReplicateTo 排除已经使用的和失败的Id
+
+				复制的过程如下:
+					获取 BlockManager
+					上传 Block到BlockManager
+					如果上传成功,将此BlockManager添加到peersReplicatedTo;而从peersForReplication中移除;设置 maxReplicationFailed = false,done = true
+					如果上传出现异常,将此BlockManager添加到peersReplicateTo, failure自增,设置 replicationFailed = true,done = false
+				如果上传失败,会迭代多次上述过程,直到失败次数>最大失败次数
+				异步上传方法 uploadBlockSync,实际通过调用blockTransferService.uploadBlock来完成的
+					val buffer = new BlockManagerManagedBuffer(blockInfoManager, blockId, data, false,
+					          unlockOnDeallocate = false)
+					blockTransferService.uploadBlockSync(
+
+				updateBlockSync的实际代码如下
+					def uploadBlockSync(
+					    hostname: String,
+					    port: Int,
+					    execId: String,
+					    blockId: BlockId,
+					    blockData: ManagedBuffer,
+					    level: StorageLevel,
+					    classTag: ClassTag[_]): Unit = {
+					  val future = uploadBlock(hostname, port, execId, blockId, blockData, level, classTag)
+					  ThreadUtils.awaitResult(future, Duration.Inf)
+					}
