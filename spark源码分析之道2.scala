@@ -915,3 +915,15 @@
 								bbos.toChunkedByteBuffer
 							}
 					其中,wrapForCompression,spark.serializer.SerializerManager.dataSerializeStream下面的方法
+
+				3.9 metadataCleaner broadcastCleaner
+					为了有效利用磁盘空间和内存 metadataCleaner broadcastCleaner 分别清除 blockInfo(TimeStampedHashMap[BlockId, BlockInfo])中很久不用的非广播和广播Block信息
+					metadataCleaner 的关键是 cleanupFunc:(Long)=>Unit,函数参数
+					似乎被取消了
+				3.10 缓存管理器 CacheManager spark.sql.execution.cacheManager
+					用于缓存RDD某个分区计算后的中间结果
+					RDD并非都缓存在CacheManager的存储部分中; CacheManager知识针对BlockManager的代理;真正的缓存依然使用BlockManager
+					当判断存储级别使用了缓存,就会调用CacheManager的getorcompute方法
+					executor端从内存缓存或者磁盘缓存读取RDD partition,如果没有,则更新RDD partition到内存缓存或者磁盘缓存
+
+					spark.rdd.RDD.scala 中的 getOrCompute		
