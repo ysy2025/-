@@ -926,4 +926,287 @@
 					当判断存储级别使用了缓存,就会调用CacheManager的getorcompute方法
 					executor端从内存缓存或者磁盘缓存读取RDD partition,如果没有,则更新RDD partition到内存缓存或者磁盘缓存
 
-					spark.rdd.RDD.scala 中的 getOrCompute		
+					spark.rdd.RDD.scala 中的 getOrCompute
+				private[spark] def getOrCompute(partition: Partition, context: TaskContext): Iterator[T] = {
+				  val blockId = RDDBlockId(id, partition.index)
+				  var readCachedBlock = true
+				  // This method is called on executors, so we need call SparkEnv.get instead of sc.env.
+				  SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
+				    readCachedBlock = false
+				    computeOrReadCheckpoint(partition, context)
+				  }) match {
+				    case Left(blockResult) =>
+				      if (readCachedBlock) {
+				        val existingMetrics = context.taskMetrics().inputMetrics
+				        existingMetrics.incBytesRead(blockResult.bytes)
+				        new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
+				          override def next(): T = {
+				            existingMetrics.incRecordsRead(1)
+				            delegate.next()
+				          }
+				        }
+				      } else {
+				        new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
+				      }
+				    case Right(iter) =>
+				      new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+				  }
+				}
+
+				首先获取blockid;然后设置 是否 readcachedblock
+				然后 计算或者读取checkpoint,根据匹配情况
+					是 Left(blockResult)
+						如果 readCachedBlock = true,
+							设置 existingMetrics
+							读取 existingMetrics
+							封装为 InterruptibleIterator,可以打断的迭代器方法,并构建 next方法
+						如果 readCachedBlock = false,
+							直接调用 new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
+					是 Right(iter)
+						调用 new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+
+				putInBlockManager
+				首先获取实际的存储级别
+				如果存储级别不允许使用内存,直接调用blockmanager的putiterator.在doput方法的处理中,由于存储级别不允许使用内存所以数据实际直接写入了磁盘或者tachyon
+				如果存储级别允许使用内存,那么首先尝试展开;如果展开成功,说明有足够内存可以存储数据,将数据存入内存;如果展开失败将数据存入磁盘
+
+				3.11 压缩算法
+					为了届生磁盘空间,有时候需要对block压缩.
+					spark.io.compression.codec 来确定使用的压缩算法,默认为snappy;此压缩算法在习生少量压缩比的情况下极大提高了压缩速度
+					参考spark.io.CompressionCodec
+						private[spark] object CompressionCodec {
+
+						  private val configKey = "spark.io.compression.codec"
+
+						  private[spark] def supportsConcatenationOfSerializedStreams(codec: CompressionCodec): Boolean = {
+						    (codec.isInstanceOf[SnappyCompressionCodec] || codec.isInstanceOf[LZFCompressionCodec]
+						      || codec.isInstanceOf[LZ4CompressionCodec] || codec.isInstanceOf[ZStdCompressionCodec])
+						  }
+
+						  private val shortCompressionCodecNames = Map(
+						    "lz4" -> classOf[LZ4CompressionCodec].getName,
+						    "lzf" -> classOf[LZFCompressionCodec].getName,
+						    "snappy" -> classOf[SnappyCompressionCodec].getName,
+						    "zstd" -> classOf[ZStdCompressionCodec].getName)
+
+						  def getCodecName(conf: SparkConf): String = {
+						    conf.get(configKey, DEFAULT_COMPRESSION_CODEC)
+						  }
+
+						  def createCodec(conf: SparkConf): CompressionCodec = {
+						    createCodec(conf, getCodecName(conf))
+						  }
+						  ...
+						}
+				3.12 磁盘写入实现DiskBlockObjectWriter
+					spark.org.DiskBlockObjectWriter.scala
+					DiskBlockObjectWriter 被用于输出 Spark 任务的中间计算结果; DiskBlockObjectWriter 的fileSegment方法用于创建文件分片 FileSegment(FileSegment 记录分片的起始,结束偏移量)
+					DiskBlockObjectWriter.commitAndGet()方法
+					val fileSegment = new FileSegment(file, committedPosition, pos - committedPosition)
+
+					open方法,打开文件输出流,利用NIO,压缩,缓存,序列化方式打开输出流
+						def open(): DiskBlockObjectWriter = {
+						  if (hasBeenClosed) {
+						    throw new IllegalStateException("Writer already closed. Cannot be reopened.")
+						  }
+						  if (!initialized) {
+						    initialize()
+						    initialized = true
+						  }
+						  bs = serializerManager.wrapStream(blockId, mcs)
+						  objOut = serializerInstance.serializeStream(bs)
+						  streamOpen = true
+						  this
+						}
+					先看是否关闭了,关闭就算了,反之,判断是否初始化?如果未初始化就初始化,初始化了就序列化然后打开
+
+					write 方法用于将数据写入文件,并更新测量信息
+						def write(key: Any, value: Any) {
+						  if (!streamOpen) {
+						    open()
+						  }
+						  objOut.writeKey(key)
+						  objOut.writeValue(value)
+						  recordWritten()
+						}
+						override def write(b: Int): Unit = throw new UnsupportedOperationException()
+						override def write(kvBytes: Array[Byte], offs: Int, len: Int): Unit = {
+						  if (!streamOpen) {
+						    open()
+						  }
+						  bs.write(kvBytes, offs, len)
+						}
+					新版本里面,将write拆成几种情况了
+						/**
+						 * Notify the writer that a record worth of bytes has been written with OutputStream#write.
+						 */
+						def recordWritten(): Unit = {
+						  numRecordsWritten += 1
+						  writeMetrics.incRecordsWritten(1)
+						  if (numRecordsWritten % 16384 == 0) {
+						    updateBytesWritten()
+						  }
+						}
+						/**
+						 * Report the number of bytes written in this writer's shuffle write metrics.
+						 * Note that this is only valid before the underlying streams are closed.
+						 */
+						private def updateBytesWritten() {
+						  val pos = channel.position()
+						  writeMetrics.incBytesWritten(pos - reportedPosition)
+						  reportedPosition = pos
+						}
+					close 方法用于关闭文件输出流,并且更新测量信息
+						/**
+						 * Commits any remaining partial writes and closes resources.
+						 */
+						override def close() {
+						  if (initialized) {
+						    Utils.tryWithSafeFinally {
+						      commitAndGet()
+						    } {
+						      closeResources()
+						    }
+						  }
+						}
+					缓存数据提交 commitandclose
+
+				3.13 块索引 shuflle管理器 IndexShuffleBlockManager
+					IndexShuffleBlockManager 索引shuffle管理器,用于获取Block索引文件,并根据索引文件读取Block文件的数据
+					获取shuffle文件方法 getBlockData
+						如果不知道Block的Id,就无法使用BlockManager的get方法
+						如果知道 ShuffleBlockId,就可以通过 ShuffleBlockId 记录的 shuffleid和mapid获取Block
+					这个是 spark.storage.BlockId.scala 的脚本
+						case class ShuffleBlockId(shuffleId: Int, mapId: Int, reduceId: Int) extends BlockId {
+						  override def name: String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId
+						}
+					按照上面的格式可以生成 ShuffleBlockId, 把信息都穿起来了
+
+					getBlockData,根据 ShuffleBlockId 记录的 shuffleId, mapId, reduceId 获取block,读取索引文件,从索引文件中获得partition计算中间结果写入文件的偏移量和中间结果的大小
+					然后按照偏移量和大小读取文件中 partition的中间计算结果
+
+						override def getBlockData(blockId: ShuffleBlockId): ManagedBuffer = {
+						  // The block is actually going to be a range of a single map output file for this map, so
+						  // find out the consolidated file, then the offset within that from our index
+						  val indexFile = getIndexFile(blockId.shuffleId, blockId.mapId)
+						  // SPARK-22982: if this FileInputStream's position is seeked forward by another piece of code
+						  // which is incorrectly using our file descriptor then this code will fetch the wrong offsets
+						  // (which may cause a reducer to be sent a different reducer's data). The explicit position
+						  // checks added here were a useful debugging aid during SPARK-22982 and may help prevent this
+						  // class of issue from re-occurring in the future which is why they are left here even though
+						  // SPARK-22982 is fixed.
+						  val channel = Files.newByteChannel(indexFile.toPath)
+						  channel.position(blockId.reduceId * 8L)
+						  val in = new DataInputStream(Channels.newInputStream(channel))
+						  try {
+						    val offset = in.readLong()
+						    val nextOffset = in.readLong()
+						    val actualPosition = channel.position()
+						    val expectedPosition = blockId.reduceId * 8L + 16
+						    if (actualPosition != expectedPosition) {
+						      throw new Exception(s"SPARK-22982: Incorrect channel position after index file reads: " +
+						        s"expected $expectedPosition but actual position was $actualPosition.")
+						    }
+						    new FileSegmentManagedBuffer(
+						      transportConf,
+						      getDataFile(blockId.shuffleId, blockId.mapId),
+						      offset,
+						      nextOffset - offset)
+						  } finally {
+						    in.close()
+						  }
+						}
+					获取shuffle数据文件方法, getDataFile
+					getDataFile的实现代码如下
+						def getDataFile(shuffleId: Int, mapId: Int): File = {
+						  blockManager.diskBlockManager.getFile(ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID))
+						}
+
+					索引文件偏移量记录方法 writeindexfile
+						writeindexfile 用于在block索引文件中记录各个partition的偏移量信息,便于下游stage的任务读取
+						被 writeIndexFileAndCommit 方法替代了
+							def writeIndexFileAndCommit(
+							    shuffleId: Int,
+							    mapId: Int,
+							    lengths: Array[Long],
+							    dataTmp: File): Unit = {
+							  val indexFile = getIndexFile(shuffleId, mapId)
+							  val indexTmp = Utils.tempFileWith(indexFile)
+							  try {
+							    val dataFile = getDataFile(shuffleId, mapId)
+							    // There is only one IndexShuffleBlockResolver per executor, this synchronization make sure
+							    // the following check and rename are atomic.
+							    synchronized {
+							      val existingLengths = checkIndexAndDataFile(indexFile, dataFile, lengths.length)
+							      if (existingLengths != null) {
+							        // Another attempt for the same task has already written our map outputs successfully,
+							        // so just use the existing partition lengths and delete our temporary map outputs.
+							        System.arraycopy(existingLengths, 0, lengths, 0, lengths.length)
+							        if (dataTmp != null && dataTmp.exists()) {
+							          dataTmp.delete()
+							        }
+							      } else {
+							        // This is the first successful attempt in writing the map outputs for this task,
+							        // so override any existing index and data files with the ones we wrote.
+							        val out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(indexTmp)))
+							        Utils.tryWithSafeFinally {
+							          // We take in lengths of each block, need to convert it to offsets.
+							          var offset = 0L
+							          out.writeLong(offset)
+							          for (length <- lengths) {
+							            offset += length
+							            out.writeLong(offset)
+							          }
+							        } {
+							          out.close()
+							        }
+							        if (indexFile.exists()) {
+							          indexFile.delete()
+							        }
+							        if (dataFile.exists()) {
+							          dataFile.delete()
+							        }
+							        if (!indexTmp.renameTo(indexFile)) {
+							          throw new IOException("fail to rename file " + indexTmp + " to " + indexFile)
+							        }
+							        if (dataTmp != null && dataTmp.exists() && !dataTmp.renameTo(dataFile)) {
+							          throw new IOException("fail to rename file " + dataTmp + " to " + dataFile)
+							        }
+							      }
+							    }
+							  } finally {
+							    if (indexTmp.exists() && !indexTmp.delete()) {
+							      logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+							    }
+							  }
+							}
+						首先,获取indexfile,indextmp;然后尝试获取datafile
+						Synchronized是Java对monitor的实现,可以对代码块或方法使用,使得每次只能有一个线程访问,实现了线程互斥.当一个线程获取了锁,其他线程将在队列上等待,实现了线程同步.
+						线程锁:
+							首先获取存在的长度
+							如果存在长度:
+								复制array
+								如果 datatmp存在,删除
+							否则
+								out = 新的输出流
+								安全尝试
+									偏移= 0
+									输出流写入偏移量
+									在长度范围内
+										offset += length
+										输出流写入偏移量
+							一顿删除文件
+							报错
+				3.14 shuffle内存管理器 ShuffleMemoryManager;似乎整个shufflememorymanager都被干掉了
+					ShuffleMemoryManager 用于执行shuffle操作的线程分配内存池;每种磁盘溢出,都能从内存池获取内存;当溢出集合的数据输出到存储空间,获得的内存就会释放
+					当线程执行的任务结束,整个内存池都会被executor释放; ShuffleMemoryManager可以保证每个线程都能合理共享内存,而不会让一些线程获得很大内存,导致其他线程经常不得不将溢出的数据写入磁盘
+
+					尝试获取内存的方法 tryToAcquire
+					用于当前线程尝试获得numBytes大小的内存,并且返回实际获得的内存大小
+					好像没有此方法了
+					https://www.imooc.com/article/267516
+
+
+				3.15 小结
+					本章节首先介绍了 BlockStore的接口定义;目前有memorystore,diskstore,tachyonstore
+					此外filesegment和block索引文件共同解决了分区数据读写同一文件的问题
