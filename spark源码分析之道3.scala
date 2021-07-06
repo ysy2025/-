@@ -394,3 +394,72 @@ ShuffledRDD.scala中包含了 ShuffledRDD 的实现方法
 def fromRDD[K: ClassTag, V: ClassTag](rdd: RDD[(K, V)]): JavaPairRDD[K, V] = {
   new JavaPairRDD[K, V](rdd)
 }
+
+4.4 任务提交
+4.4.1 任务提价的准备
+接下来要执行 JavaPairRDD的word count 方法了. collect方法,调用了RDD的collect方法后转成Seq,并封装Seq成为ArrayList.
+新版本在JavaRDDLike.scala中
+def collect(): JList[T] =
+  rdd.collect().toSeq.asJava
+老版本中
+def collect():JList[T] = {
+	import scala.collection.JavaConversions._
+	val arr:java.util.Collection[T] = rdd.collect().toSeq
+	new java.util.ArrayList(arr)
+}
+
+RDD的collect方法实现方式如下,在RDD.scala中
+def collect(): Array[T] = withScope {
+  val results = sc.runJob(this, (iter: Iterator[T]) => iter.toArray)
+  Array.concat(results: _*)
+}
+
+SparkContext的runjob调用了重载的runJob
+这里的runJob调用SparkContext.scala
+def runJob[T, U: ClassTag](rdd: RDD[T], func: Iterator[T] => U): Array[U] = {
+  runJob(rdd, func, 0 until rdd.partitions.length)
+}
+这里的runJob再次重载,都是往上
+def runJob[T, U: ClassTag](
+    rdd: RDD[T],`
+    func: Iterator[T] => U,
+    partitions: Seq[Int]): Array[U] = {
+  val cleanedFunc = clean(func)
+  runJob(rdd, (ctx: TaskContext, it: Iterator[T]) => cleanedFunc(it), partitions)
+}
+继续上溯
+def runJob[T, U: ClassTag](
+    rdd: RDD[T],
+    func: (TaskContext, Iterator[T]) => U,
+    partitions: Seq[Int]): Array[U] = {
+  val results = new Array[U](partitions.size)
+  runJob[T, U](rdd, func, partitions, (index, res) => results(index) = res)
+  results
+}
+
+最后上溯到
+def runJob[T, U: ClassTag](
+    rdd: RDD[T],
+    func: (TaskContext, Iterator[T]) => U,
+    partitions: Seq[Int],
+    resultHandler: (Int, U) => Unit): Unit = {
+  if (stopped.get()) {
+    throw new IllegalStateException("SparkContext has been shutdown")
+  }
+  val callSite = getCallSite
+  val cleanedFunc = clean(func)
+  logInfo("Starting job: " + callSite.shortForm)
+  if (conf.getBoolean("spark.logLineage", false)) {
+    logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
+  }
+  dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
+  progressBar.foreach(_.finishAll())
+  rdd.doCheckpoint()
+}
+调用clean方法,纺织闭包的反序列化错误;并且运行dagScheduler的runJob;DAGScheduler.scala 的runJob
+这里主要调用submitJob,提交任务.
+waiter.awaitResult说明任务是异步的
+
+
+
+1,提交任务
