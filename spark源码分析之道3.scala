@@ -463,3 +463,163 @@ waiter.awaitResult说明任务是异步的
 
 
 1,提交任务
+submitJob,用来提交job到jobscheduler
+def submitJob[T, U](
+    rdd: RDD[T],
+    func: (TaskContext, Iterator[T]) => U,
+    partitions: Seq[Int],
+    callSite: CallSite,
+    resultHandler: (Int, U) => Unit,
+    properties: Properties): JobWaiter[U] = {
+  // Check to make sure we are not launching a task on a partition that does not exist.
+  val maxPartitions = rdd.partitions.length
+  partitions.find(p => p >= maxPartitions || p < 0).foreach { p =>
+    throw new IllegalArgumentException(
+      "Attempting to access a non-existent partition: " + p + ". " +
+        "Total number of partitions: " + maxPartitions)
+  }
+1,首先获取最大分区数,确认我们不是在一个不存在的partition上运行任务
+2,然后生成当前job的id
+3,创建jobwaiter,即job的服务员.实现方式见JobWaiter.scala
+4,向 eventProcessLoop 发送jobsubmitted事件;实现方式在DAGScheduler.scala中
+这里的eventProcessLoop,实现方式如下
+private[spark] val eventProcessLoop = new DAGSchedulerEventProcessLoop(this)
+5,返回JobWaiter
+
+2,处理Job提交
+老版本 DAGSchedulerEventProcessActor, 新版本DAGSchedulerEventProcessLoop,收到JobSubmitted事件,会调用dagScheduler的handleJobSUbmitted方法
+private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler)
+  extends EventLoop[DAGSchedulerEvent]("dag-scheduler-event-loop") with Logging {
+
+  private[this] val timer = dagScheduler.metricsSource.messageProcessingTimer
+
+  /**
+   * The main event loop of the DAG scheduler.
+   */
+  override def onReceive(event: DAGSchedulerEvent): Unit = {
+    val timerContext = timer.time()
+    try {
+      doOnReceive(event)
+    } finally {
+      timerContext.stop()
+    }
+  }
+
+  private def doOnReceive(event: DAGSchedulerEvent): Unit = event match {
+    case JobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties) =>
+      dagScheduler.handleJobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties)
+      ...
+      //针对其他情况,例如MapStageSubmitted,StageCancelled,用其他处理方式去处理
+
+}
+handleJobSubmitted实现方式如下
+private[scheduler] def handleJobSubmitted(jobId: Int,
+    finalRDD: RDD[_],
+    func: (TaskContext, Iterator[_]) => _,
+    partitions: Array[Int],
+    callSite: CallSite,
+    listener: JobListener,
+    properties: Properties) {
+  var finalStage: ResultStage = null
+  try {
+    // New stage creation may throw an exception if, for example, jobs are run on a
+    // HadoopRDD whose underlying HDFS files have been deleted.
+    finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
+  } catch {
+  ...}
+  // Job submitted, clear internal data.
+  barrierJobIdToNumTasksCheckFailures.remove(jobId)
+
+  val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
+  clearCacheLocs()
+  logInfo("Got job %s (%s) with %d output partitions".format(
+    job.jobId, callSite.shortForm, partitions.length))
+  logInfo("Final stage: " + finalStage + " (" + finalStage.name + ")")
+  logInfo("Parents of final stage: " + finalStage.parents)
+  logInfo("Missing parents: " + getMissingParentStages(finalStage))
+
+  val jobSubmissionTime = clock.getTimeMillis()
+  jobIdToActiveJob(jobId) = job
+  activeJobs += job
+  finalStage.setActiveJob(job)
+  val stageIds = jobIdToStageIds(jobId).toArray
+  val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
+  listenerBus.post(
+    SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
+  submitStage(finalStage)
+}
+首先,创建finalstage和stage的划分;注意异常的时候要报错;BarrierJobSlotsNumberCheckFailed 的时候,有自己的处理方式
+  首先log记录
+  然后,计算check失败的次数;这里,脚本里面注释出现错误,Scala coverts its value,应该是 Scala converts its value
+  然后,如果失败次数不够阈值,继续run
+        反之,溢出任务,报错
+接着,创建ActiveJob,更新jobIdToActiveJob,activeJobs
+然后,向listernBus发送 SparkListenerJobStart,声明任务开始了
+提交finalstage
+
+4.4.2 finalstage的创建和stage的划分
+spark中,一个job可能被划分为一个或多个stage;各个之间存在依赖关系;最下游的stage是finalstage
+1,newstage的实现分析
+handleJobSubmitted 使用 createResultStage 来创建finalstage
+private def createResultStage(
+    rdd: RDD[_],
+    func: (TaskContext, Iterator[_]) => _,
+    partitions: Array[Int],
+    jobId: Int,
+    callSite: CallSite): ResultStage = {
+  checkBarrierStageWithDynamicAllocation(rdd)
+  checkBarrierStageWithNumSlots(rdd)
+  checkBarrierStageWithRDDChainPattern(rdd, partitions.toSet.size)
+  val parents = getOrCreateParentStages(rdd, jobId)
+  val id = nextStageId.getAndIncrement()
+  val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
+  stageIdToStage(id) = stage
+  updateJobIdStageIdMaps(jobId, stage)
+  stage
+}
+
+首先checkbarrierstage,包括 DynamicAllocation,numslots,RDDChainPattern
+然后 getOrCreateParentStages,获取或者创建父stage
+获取id
+获取stage
+然后将stage注册到 stageIdToStage
+updateJobIdStageIdMaps,更新stage里面的Job以及对应关系
+
+2,获取或者创建父stage
+spark中,Job会划分为1到n个stage;这些stage的划分是从finalstage开始;从后往前,一边划分一边创建.getOrCreateParentStages 用于获取或者创建给定RDD的所有父stage,这些stage将被分配给jobId对应的job
+getOrCreateParentStages的实现如下
+private def getOrCreateParentStages(rdd: RDD[_], firstJobId: Int): List[Stage] = {
+  getShuffleDependencies(rdd).map { shuffleDep =>
+    getOrCreateShuffleMapStage(shuffleDep, firstJobId)
+  }.toList
+}
+和老版本不同,这里的实现过程如下
+对rdd获取shuffle依赖;
+然后对每一个依赖,都获取或者创建shufflemapstage
+最后转为list
+
+getOrCreateShuffleMapStage的实现如下:
+private def getOrCreateShuffleMapStage(
+    shuffleDep: ShuffleDependency[_, _, _],
+    firstJobId: Int): ShuffleMapStage = {
+  shuffleIdToMapStage.get(shuffleDep.shuffleId) match {
+    case Some(stage) =>
+      stage
+    case None =>
+      // Create stages for all missing ancestor shuffle dependencies.
+      getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
+        // Even though getMissingAncestorShuffleDependencies only returns shuffle dependencies
+        // that were not already in shuffleIdToMapStage, it's possible that by the time we
+        // get to a particular dependency in the foreach loop, it's been added to
+        // shuffleIdToMapStage by the stage creation process for an earlier dependency. See
+        // SPARK-13902 for more information.
+        if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
+          createShuffleMapStage(dep, firstJobId)
+        }
+      }
+      // Finally, create a stage for the given shuffle dependency.
+      createShuffleMapStage(shuffleDep, firstJobId)
+  }
+}
+如果注册了stage,就直接返回
+如果没有这个stage,用 getMissingAncestorShuffleDependencies,为 shuffleDep.rdd, 每一个依赖,都 createShuffleMapStage
