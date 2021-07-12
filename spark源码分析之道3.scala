@@ -623,3 +623,81 @@ private def getOrCreateShuffleMapStage(
 }
 如果注册了stage,就直接返回
 如果没有这个stage,用 getMissingAncestorShuffleDependencies,为 shuffleDep.rdd, 每一个依赖,都 createShuffleMapStage
+
+3,获取map任务对应的Stage
+老版本是 getShuffleMapStage方法, 新版本是 getOrCreateShuffleMapStage方法
+
+private def getOrCreateShuffleMapStage(
+    shuffleDep: ShuffleDependency[_, _, _],
+    firstJobId: Int): ShuffleMapStage = {
+  shuffleIdToMapStage.get(shuffleDep.shuffleId) match {
+    case Some(stage) =>
+      stage
+    case None =>
+      // Create stages for all missing ancestor shuffle dependencies.
+      getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
+        // Even though getMissingAncestorShuffleDependencies only returns shuffle dependencies
+        // that were not already in shuffleIdToMapStage, it's possible that by the time we
+        // get to a particular dependency in the foreach loop, it's been added to
+        // shuffleIdToMapStage by the stage creation process for an earlier dependency. See
+        // SPARK-13902 for more information.
+        if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
+          createShuffleMapStage(dep, firstJobId)
+        }
+      }
+      // Finally, create a stage for the given shuffle dependency.
+      createShuffleMapStage(shuffleDep, firstJobId)
+  }
+}
+利用 shuffleIdToMapStage 获取shuffleDep的shuffleId,然后看属于哪种情况:
+	case None时,为所有 missing ancestor shuffle dependencies创建 stage
+	最后为 给定的 shuffle dependency 创建stage
+	老版本里面,registerShuffleDependencies,现在是 getMissingAncestorShuffleDependencies
+
+老版本中, newOrUsedStage方法被createShuffleMapStage替代
+创建shufflemapstage
+调用 ShuffleMapStage.scala中的ShuffleMapStage类 创建stage
+ShuffleMapStage类 extends Stage类; Stage.scala中的 Stage类
+在该类的实现脚本中,利用了 StageInfo.scala的StageInfo类的fromStage方法;从stage中获取信息
+def fromStage(
+    stage: Stage,
+    attemptId: Int,
+    numTasks: Option[Int] = None,
+    taskMetrics: TaskMetrics = null,
+    taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty
+  ): StageInfo = {
+  val ancestorRddInfos = stage.rdd.getNarrowAncestors.map(RDDInfo.fromRdd)
+  val rddInfos = Seq(RDDInfo.fromRdd(stage.rdd)) ++ ancestorRddInfos
+  new StageInfo(
+    stage.id,
+    attemptId,
+    stage.name,
+    numTasks.getOrElse(stage.numTasks),
+    rddInfos,
+    stage.parents.map(_.id),
+    stage.details,
+    taskMetrics,
+    taskLocalityPreferences)
+  }
+}
+1,调用getNarrowAncestors方法获取 RDD的所有直接或者间接的NarrowAncestors的依赖;
+private[spark] def getNarrowAncestors: Seq[RDD[_]] = {
+  val ancestors = new mutable.HashSet[RDD[_]]
+  def visit(rdd: RDD[_]) {
+    val narrowDependencies = rdd.dependencies.filter(_.isInstanceOf[NarrowDependency[_]])
+    val narrowParents = narrowDependencies.map(_.rdd)
+    val narrowParentsNotVisited = narrowParents.filterNot(ancestors.contains)
+    narrowParentsNotVisited.foreach { parent =>
+      ancestors.add(parent)
+      visit(parent)
+    }
+  }
+  visit(this)
+  // In case there is a cycle, do not include the root itself
+  ancestors.filterNot(_ == this).toSeq
+}
+2,对当前Stage的RDD调用RDDInfo.fromRdd,也生成RDDInfo;
+创建当前Stage的StageInfo
+
+updateJobIdStageIdMaps方法,通过迭代调用内部的updateJobIdStageIdMapsList方法,最终将jobId添加到Stage和它的所有祖先
+Stage的映射jobIds中.
