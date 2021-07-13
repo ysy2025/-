@@ -701,3 +701,68 @@ private[spark] def getNarrowAncestors: Seq[RDD[_]] = {
 
 updateJobIdStageIdMaps方法,通过迭代调用内部的updateJobIdStageIdMapsList方法,最终将jobId添加到Stage和它的所有祖先
 Stage的映射jobIds中.
+
+4.4.3 创建ActiveJob
+ActiveJob.scala中的 ActiveJob类;
+SparkListenerJobStart事件的处理,从代码中可知,SparkListenerBus的sparkListeners中,凡是实现了onJobStart方法的,将被chul
+
+4.4.3 提交Stage
+在提交finalStage之前,如果存在没有提交的祖先Stage,则需要先提交所有没有提交的祖先Stage;并且需要将子Stage放入waitingStages=newHashSet中等待
+如果不存在没有提交的祖先Stage,则提交所有未提交的Task
+
+submitStage的实现代码如下:DAGScheduler.scala中的 submitStage方法
+private def submitStage(stage: Stage) {
+  val jobId = activeJobForStage(stage)
+  if (jobId.isDefined) {
+    logDebug("submitStage(" + stage + ")")
+    if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
+      val missing = getMissingParentStages(stage).sortBy(_.id)
+      logDebug("missing: " + missing)
+      if (missing.isEmpty) {
+        logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
+        submitMissingTasks(stage, jobId.get)
+      } else {
+        for (parent <- missing) {
+          submitStage(parent)
+        }
+        waitingStages += stage
+      }
+    }
+  } else {
+    abortStage(stage, "No active job for stage " + stage.id, None)
+  }
+}
+
+getMissingParentStages用来获取Stage的所有不可用的祖先Stage;
+首先,定义missing,visited,waitingForVisited;然后,如果rdd没有访问,就增加一个visited;
+然后初始化 rdd有没有缓存的分区
+对于rdd的依赖
+	如果依赖是shuffledependencies,则 getOrCreateShuffleMapStage;
+	如果依赖是narrowdependencies,则将这个依赖加到等待访问的队列中
+然后针对每一个等待访问的依赖进行访问
+
+如何判断stage可用?如果stage不是map任务,就是可用的;否则它的已经输出的计算结果的分区任务数量==分区数(所有分区的子任务都完成)
+
+4.4.5 提交Task
+提交Task的入口是,submitMissingTasks函数;此函数在Stage没有不可用的祖先Stage时,被调用处理当前Stage未提交的任务
+pending tasks,存储有待处理的tasks(新版本好像没有了)
+mapstatus,包括执行task的blockmanager的地址和要传给reduce任务的block的估算大小(新版本好像没有了)
+outputlocs,如果stage是map任务,则outputloc记录每个partition的mapstatus(新版本好像没有了)
+
+1,清空pendingtasks(好像没有了)
+2,找出还没计算的partition
+3,将当前stage加入运行中的stage集合
+4,根据stage情况处理.如果stage是ShuffleMapStage任务,outputCommitCoordinator.stageStart;如果stage是ResultStage outputCommitCoordinator.stageStart
+5,初始化 taskIdToLocations
+6,stage.makeNewStageAttempt,尝试新stage
+7,向listenerbus发送SparkListenerStageSubmitted
+8,构造taskBinary;
+9,初始化tasks;
+10,根据tasks.size,确定方向
+
+submitTasks 方法,有两个实现,一个是TaskSchedulerImpl.scala中的 submitTasks方法,一个是TaskScheduler.scala的 submitTasks方法
+两个步骤:
+1,构建任务管理器;即将 一个是TaskScheduler,TaskSet,最大失败次数封装为TaskSetManager
+2,设置任务集调度策略.Fair,FIFO.将TaskSetManager添加到FifoSchedulableBuilder中
+这里,调用了SchedulableBuilder.scala的 SchedulableBuilder类的addTaskSetManager
+3,资源分配.调用 backend.reviveOffers(), 发送消息
