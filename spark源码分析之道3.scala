@@ -749,6 +749,8 @@ pending tasks,存储有待处理的tasks(新版本好像没有了)
 mapstatus,包括执行task的blockmanager的地址和要传给reduce任务的block的估算大小(新版本好像没有了)
 outputlocs,如果stage是map任务,则outputloc记录每个partition的mapstatus(新版本好像没有了)
 
+1,提交还没有计算的任务
+
 1,清空pendingtasks(好像没有了)
 2,找出还没计算的partition
 3,将当前stage加入运行中的stage集合
@@ -766,3 +768,6 @@ submitTasks 方法,有两个实现,一个是TaskSchedulerImpl.scala中的 submit
 2,设置任务集调度策略.Fair,FIFO.将TaskSetManager添加到FifoSchedulableBuilder中
 这里,调用了SchedulableBuilder.scala的 SchedulableBuilder类的addTaskSetManager
 3,资源分配.调用 backend.reviveOffers(), 发送消息
+
+2,资源分配
+resourceOffers 用于Task任务的资源分配
