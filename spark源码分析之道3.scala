@@ -771,3 +771,15 @@ submitTasks 方法,有两个实现,一个是TaskSchedulerImpl.scala中的 submit
 
 2,资源分配
 resourceOffers 用于Task任务的资源分配
+TaskSchedulerImpl.scala中,resourceOffers方法的实现
+
+首先,标记每个slave的状态是alive的,然后记住hostname;如果有新executor加入,就追踪
+在提供offer之前,移走黑名单中过期的节点.这里避免孤立的线程,增加同步;同时注意更新相关的黑名单
+建立一系列的任务来分配给每个worker
+
+计算资源的分配和计算;对workeroffer随机shuffle,避免将任务总是分配给同样的workeroffer
+
+根据每个workeroffer的可用的cup数量创建任务
+将每个workeroffer的可用的cpu数量统计到可用的cpu数组中
+对taskset排序
+调用resourceOfferSingleTaskSet,对每一个任务给与资源
