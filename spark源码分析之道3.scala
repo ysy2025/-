@@ -783,3 +783,234 @@ TaskSchedulerImpl.scala中,resourceOffers方法的实现
 将每个workeroffer的可用的cpu数量统计到可用的cpu数组中
 对taskset排序
 调用resourceOfferSingleTaskSet,对每一个任务给与资源
+
+
+3.worker任务分配
+TaskSetManager.scala 中,resourceOffer方法,给worker分配task
+1,获取黑名单
+2,获取当前任务集允许使用的本地化级别;在这里要针对maxLocality和TaskLocality进行判断;调用findtask寻找有待运行的task
+3,创建taskinfo,并对task,addedfiles,addedjars进行序列化
+4,调用Dagscheduler的taskstarted方法,启动task;深入钻下去可以发现
+def taskStarted(task: Task[_], taskInfo: TaskInfo) {
+  eventProcessLoop.post(BeginEvent(task, taskInfo))
+}
+5,封装成TaskDescription
+
+4,本地化分析
+spark中任务的处理需要考虑数据的本地性
+spark目前支持 process_local,node_local,no_pref,rack_local,any 几种
+
+spark涉及本地性的数据只有2中,HadoopRDD和数据源于存储体系的RDD.
+NO_Pref,任务分配时,优先分配到非本地节点执行,达到一定的优化效果.
+
+getAllowedLocalityLevel,获取允许的本地级别,这个方法很常见了.
+TaskSetManager.scala中 getAllowedLocalityLevel方法
+myLocalityLevels,允许使用的本地化级别;myLocalityLevels = computeValidLocalityLevels(),计算有效的本地化级别.
+
+spark.locality.wait, 本地化级别的默认等待时间
+spark.locality.wait.process, 本地进程的等待时间
+spark.locality.wait.node,本地节点的等待时间
+spark.locality.wait.rack,本地机架的等待时间
+
+关于getAllowedLocalityLevel的具体内容:
+1,移除既定的或者完成的task
+2,定义 moretaskstorunin,更多任务要运行.
+
+4.5 执行任务
+spark.executor.Executor.scala 中的 class Executor;
+前面定义了一大堆,到了launchTask,执行任务的时候了
+
+def launchTask(context: ExecutorBackend, taskDescription: TaskDescription): Unit = {
+  val tr = new TaskRunner(context, taskDescription)
+  runningTasks.put(taskDescription.taskId, tr)
+  threadPool.execute(tr)
+}
+首先定义TaskRunner;然后,将task放进去
+TaskRunner实现了Runnable.
+
+线程执行时,执行Executor的TaskRunner类的run方法
+4.5.1 状态更新
+run方法中,调用execBackend.statusUpdate(taskId, TaskState.RUNNING, EMPTY_BYTE_BUFFER)来更新状态.
+4.5.2 任务还原
+将Driver提交的Task在Executor上通过反序列化,更新依赖,达到Task还原效果的过程.
+首先,更新依赖
+然后,ser.deserializetask = ser.deserialize[Task[Any]](taskDescription.serializedTask, Thread.currentThread.getContextClassLoader)
+
+4.5.3 任务运行
+val res = task.run(taskAttemptId = taskId,
+            attemptNumber = taskDescription.attemptNumber,
+            metricsSystem = env.metricsSystem)
+具体的实现,在spark.scheduler.Task.scala中实现了
+首先创建 val taskContext = new TaskContextImpl.设置到TaskContext的ThreadLocal中.最后调用runTask方法.
+
+在wordcount,首先执行的task是shufflemaptask;spark.scheduler.ShuffleMapTask.scala
+首先反序列化,
+利用 SparkEnv.get.shuffleManager.getWriter,获取partitionId指定分区的SortShuffleWriter
+之后利用writer将计算的中间结果写入文件
+
+
+4.6 任务执行后续处理
+4.6.1 计量统计与执行结果序列化
+任务执行结束后,会有计量统计和结果序列化
+1,任务执行结果的简单序列化
+2,计量统计
+
+具体的实现还是在Executor.scala中的TaskRunner类的run方法
+
+4.6.2 内存回收
+计算完参数之后,要更新 accumulator;
+要注意,不要序列化value两次;
+然后计算directresult;序列化之;然后计算结果的size
+获取序列化的result
+然后设置taskfinished,清除中断状态;就是前面说的 statusUpdate
+
+在run过程中遇到错误:
+  TaskKilledException时;
+  InterruptedException时;
+  Throwable时;
+
+在Task.scala中 Task类的run方法,
+SparkEnv.get.blockManager.memoryStore.releaseUnrollMemoryForThisTask(MemoryMode.ON_HEAP)
+SparkEnv.get.blockManager.memoryStore.releaseUnrollMemoryForThisTask(MemoryMode.OFF_HEAP)
+
+
+4.6.3 执行结果处理
+任务完成的时候发送statusupdate;这个已经看到了
+TaskSchedulerImpl类中statusUpdate方法
+def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer) {
+  var failedExecutor: Option[String] = None
+  var reason: Option[ExecutorLossReason] = None
+  synchronized {
+    try {
+      Option(taskIdToTaskSetManager.get(tid)) match {
+        case Some(taskSet) =>
+          if (state == TaskState.LOST) {
+            // TaskState.LOST is only used by the deprecated Mesos fine-grained scheduling mode,
+            // where each executor corresponds to a single task, so mark the executor as failed.
+            val execId = taskIdToExecutorId.getOrElse(tid, {
+              val errorMsg =
+                "taskIdToTaskSetManager.contains(tid) <=> taskIdToExecutorId.contains(tid)"
+              taskSet.abort(errorMsg)
+              throw new SparkException(errorMsg)
+            })
+            if (executorIdToRunningTaskIds.contains(execId)) {
+              reason = Some(
+                SlaveLost(s"Task $tid was lost, so marking the executor as lost as well."))
+              removeExecutor(execId, reason.get)
+              failedExecutor = Some(execId)
+            }
+          }
+          if (TaskState.isFinished(state)) {
+            cleanupTaskState(tid)
+            taskSet.removeRunningTask(tid)
+            if (state == TaskState.FINISHED) {
+              taskResultGetter.enqueueSuccessfulTask(taskSet, tid, serializedData)
+            } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
+              taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
+            }
+          }
+        case None =>
+          logError(
+            ("Ignoring update with state %s for TID %s because its task set is gone (this is " +
+              "likely the result of receiving duplicate task finished status updates) or its " +
+              "executor has been marked as failed.")
+              .format(state, tid))
+      }
+    } catch {
+      case e: Exception => logError("Exception in statusUpdate", e)
+    }
+  }
+  // Update the DAGScheduler without holding a lock on this, since that can deadlock
+  if (failedExecutor.isDefined) {
+    assert(reason.isDefined)
+    dagScheduler.executorLost(failedExecutor.get, reason.get)
+    backend.reviveOffers()
+  }
+}
+调用 enqueueSuccessfulTask,将成功的任务enqueue;enqueueFailedTask,将失败的任务 enqueue
+enqueueSuccessfulTask中的scheduler.handleSuccessfulTask(taskSetManager, tid, result),是另一个线程;下钻后发现是TaskSetManager的handleSuccessfulTask方法
+
+sched.dagScheduler.taskEnded(tasks(index), Success, result.value(), result.accumUpdates, info),负责结束task
+主要的实现方式如下:
+  eventProcessLoop.post(CompletionEvent(task, reason, result, accumUpdates, taskInfo))
+提交CompletionEvent信息
+
+之后,将处理交给了 DAGScheduler.scala 的 handleTaskCompletion 方法;
+event.reason match {
+  case Success =>
+    task match {
+      case rt: ResultTask[_, _] =>
+        val resultStage = stage.asInstanceOf[ResultStage]
+        resultStage.activeJob match {
+          case Some(job) =>
+            // Only update the accumulator once for each result task.
+            if (!job.finished(rt.outputId)) {
+              updateAccumulators(event)
+            }
+          case None => // Ignore update if task's job has finished.
+        }
+      case _ =>
+        updateAccumulators(event)
+    }
+  case _: ExceptionFailure | _: TaskKilled => updateAccumulators(event)
+  case _ =>
+}
+
+任务因Task类型不同,处理方式也不同
+
+ResultTask任务的结果处理
+如果是ResultTask
+  首先获取 resultStage
+  然后看 resultStage.activeJob的情况
+  对每一个结果task更新accumulator;
+case rt: ResultTask[_, _] =>
+  // Cast to ResultStage here because it's part of the ResultTask
+  // TODO Refactor this out to a function that accepts a ResultStage
+  val resultStage = stage.asInstanceOf[ResultStage]
+  resultStage.activeJob match {
+    case Some(job) =>
+      if (!job.finished(rt.outputId)) {
+        job.finished(rt.outputId) = true
+        job.numFinished += 1
+        // If the whole job has finished, remove it
+        if (job.numFinished == job.numPartitions) {
+          markStageAsFinished(resultStage)
+          cleanupStateForJobAndIndependentStages(job)
+          listenerBus.post(
+            SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobSucceeded))
+        }
+        // taskSucceeded runs some user code that might throw an exception. Make sure
+        // we are resilient against that.
+        try {
+          job.listener.taskSucceeded(rt.outputId, event.result)
+        } catch {
+          case e: Exception =>
+            // TODO: Perhaps we want to mark the resultStage as failed?
+            job.listener.jobFailed(new SparkDriverExecutionException(e))
+        }
+      }
+    case None =>
+      logInfo("Ignoring result from " + rt + " because its job has finished")
+  }
+suffleMapTask任务类型时:
+case smt: ShuffleMapTask =>
+  val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
+  shuffleStage.pendingPartitions -= task.partitionId
+  val status = event.result.asInstanceOf[MapStatus]
+  val execId = status.location.executorId
+  logDebug("ShuffleMapTask finished on " + execId)
+  if (executorFailureEpoch.contains(execId) &&
+      smt.epoch <= executorFailureEpoch(execId)) {
+    logInfo(s"Ignoring possibly bogus $smt completion from executor $execId")
+  } else {
+    // The epoch of the task is acceptable (i.e., the task was launched after the most
+    // recent failure we're aware of for the executor), so mark the task's output as
+    // available.
+    mapOutputTracker.registerMapOutput(
+      shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
+  }
+
+4.7 小结
+Spark为什么设计RDD?依次讲解RDD的实现分析,Stage的划分,提交Stage,提交Task,任务执行,执行结果处理等内容
+Spark通过阶梯式本地化策略,有效利用资源,届生网络IO,提高系统执行效率
+容错能力方面,spark通过DAG构成有向无环图,可以在其中某些任务失败的时候重新提交任务达到容错.
