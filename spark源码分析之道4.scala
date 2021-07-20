@@ -249,4 +249,63 @@ ExternalSorter.scala的ExternalSorter类,insertAll方法中,if没有定义aggreg
   }
 }
 
-PartitionedPairBuffer.insert方法,把计算结果缓存到数组中
+PartitionedPairBuffer.insert方法,把计算结果缓存到数组中;
+穿透后发现,是通过growArray,新建2倍大小的新数组,然后简单复制而已.
+
+ExternalSorter.scala中定义了 maybeSpillCollection 方法,用来处理 SizeTrackingPairBuffer溢出;
+
+5.3.3 容量限制
+AppendOnlyMap 和 SizeTrackingPairBuffer的容量都可以增长;数据量不大时可以解决;但是数据量爆炸时,会撑爆内存.
+是否溢出?通过maybeSpill来判断;见spark.util.collection.Spillable.scala
+protected def maybeSpill(collection: C, currentMemory: Long): Boolean = {
+  var shouldSpill = false
+  if (elementsRead % 32 == 0 && currentMemory >= myMemoryThreshold) {
+    // Claim up to double our current memory from the shuffle memory pool
+    val amountToRequest = 2 * currentMemory - myMemoryThreshold
+    val granted = acquireMemory(amountToRequest)
+    myMemoryThreshold += granted
+    // If we were granted too little memory to grow further (either tryToAcquire returned 0,
+    // or we already had more memory than myMemoryThreshold), spill the current collection
+    shouldSpill = currentMemory >= myMemoryThreshold
+  }
+  shouldSpill = shouldSpill || _elementsRead > numElementsForceSpillThreshold
+  // Actually spill
+  if (shouldSpill) {
+    _spillCount += 1
+    logSpillage(currentMemory)
+    spill(collection)
+    _elementsRead = 0
+    _memoryBytesSpilled += currentMemory
+    releaseMemory()
+  }
+  shouldSpill
+}
+首先,获取 amountToRequest = 2 * currentMemory - myMemoryThreshold
+其次,如果获得的内存依然不足,调用spill执行溢出操作.
+溢出后,增加内存,释放当前线程占用的内存
+
+溢出操作
+如果溢出,见spill方法;
+override protected[this] def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
+  val inMemoryIterator = collection.destructiveSortedWritablePartitionedIterator(comparator)
+  val spillFile = spillMemoryIteratorToDisk(inMemoryIterator)
+  spills += spillFile
+}
+和老版本不同的.
+这里的 spillMemoryIteratorToDisk 方法,取代了老版本中,spilltomergeablefile方法;实现方法如下
+首先 val (blockId, file) = diskBlockManager.createTempShuffleBlock() 创建临时文件;
+定义一些参数,如 objectsWritten,写入多少?spillMetrics,溢出的数量;writer,写入工具;batchSizes,batch大小;elementsPerPartition,每个分区多少元素;
+然后调用 collection.destructiveSortedWritablePartitionedIterator,排序
+将集合内容写入临时文件:
+	集合遍历完,flush
+	遍历中,每当写入元素个数>批量序列化尺寸时,执行flush;然后重建writer
+
+5.4 map端计算结果持久化
+writePartitionedFile 用于持久化计算结果
+ExternalSorter.scala中,定义的writePartitionedFile方法;用于持久化计算结果
+两个分支:溢出到分区后合并;只在内存中排序合并
+溢出到分区后合并:将内存中缓存的多个partition的计算结果分别写入到多个临时block文件中,然后将这些block文件的额内容全部写入正式的block输出文件中
+只在内存中排序合并:缓存的中间计算结果按照partition分组后写入block输出文件
+
+5.4.1 溢出分区文件
+createTempShuffleBlock方法略.getDiskWriter方法获取写入方法
