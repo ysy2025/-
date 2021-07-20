@@ -109,6 +109,144 @@ def insertAll(records: Iterator[Product2[K, V]]): Unit = {
   }
 }
 
+
+5.3.1 map端对计算结果在缓存聚合
 任务分区很多时,如果将数据存到executor,在reduce中会存在大量网络IO,形成性能瓶颈.reduce读取map的结果变慢,导致其他想要分配到被这些map任务占用的节点的任务需要等待或者分配到更远的节点上;效率低下
 在map端,就聚合排序,可以节省IO操作,提升系统性能;
 因此需要定义聚合器aggregator函数,用来对结果聚合排序
+
+Externalsorter的insertAll方法实现如下:spark.util.collection.Externalsorter.scala
+def insertAll(records: Iterator[Product2[K, V]]): Unit = {
+  // TODO: stop combining if we find that the reduction factor isn't high
+  val shouldCombine = aggregator.isDefined
+  if (shouldCombine) {
+    // Combine values in-memory first using our AppendOnlyMap
+    val mergeValue = aggregator.get.mergeValue
+    val createCombiner = aggregator.get.createCombiner
+    var kv: Product2[K, V] = null
+    val update = (hadValue: Boolean, oldValue: C) => {
+      if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
+    }
+    while (records.hasNext) {
+      addElementsRead()
+      kv = records.next()
+      map.changeValue((getPartition(kv._1), kv._1), update)
+      maybeSpillCollection(usingMap = true)
+    }
+  } else {
+    // Stick values into our buffer
+    while (records.hasNext) {
+      addElementsRead()
+      val kv = records.next()
+      buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C])
+      maybeSpillCollection(usingMap = false)
+    }
+  }
+}
+如果,aggregator是被定义了,那么,设置了聚合函数aggregator;从聚合函数获取 mergeValue,createCombiner 等函数
+定义update函数,用于操作 mergeValue,createCombiner 
+迭代之前创建的iterator,每读取一条 Product2[K, V],就将每行组服从按照空格切分
+调用changeValue
+调用maybeSpillCollection,处理sizetrackingappendonlymap溢出
+
+spark.util.collection.SizeTrackingAppendOnlyMap.scala,changeValue方法
+override def changeValue(key: K, updateFunc: (Boolean, V) => V): V = {
+  val newValue = super.changeValue(key, updateFunc)
+  super.afterUpdate()
+  newValue
+}
+调用父类 AppendOnlyMap 的changevalue函数
+调用集成的特质SizeTracker的afterUpdate函数
+
+追踪到AppendOnlyMap.scala的AppendOnlyMap类的 changeValue 方法
+def changeValue(key: K, updateFunc: (Boolean, V) => V): V = {
+  assert(!destroyed, destructionMessage)
+  val k = key.asInstanceOf[AnyRef]
+  if (k.eq(null)) {
+    if (!haveNullValue) {
+      incrementSize()
+    }
+    nullValue = updateFunc(haveNullValue, nullValue)
+    haveNullValue = true
+    return nullValue
+  }
+  var pos = rehash(k.hashCode) & mask
+  var i = 1
+  while (true) {
+    val curKey = data(2 * pos)
+    if (curKey.eq(null)) {
+      val newValue = updateFunc(false, null.asInstanceOf[V])
+      data(2 * pos) = k
+      data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+      incrementSize()
+      return newValue
+    } else if (k.eq(curKey) || k.equals(curKey)) {
+      val newValue = updateFunc(true, data(2 * pos + 1).asInstanceOf[V])
+      data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+      return newValue
+    } else {
+      val delta = i
+      pos = (pos + delta) & mask
+      i += 1
+    }
+  }
+  null.asInstanceOf[V] // Never reached but needed to keep compiler happy
+}
+
+incrementSize 方法用于扩充AppendOnlyMap的容量
+private def incrementSize() {
+  curSize += 1
+  if (curSize > growThreshold) {
+    growTable()
+  }
+}
+
+下钻,growTable 方法;用来加倍表格容量,重新hash
+
+AppendOnlyMap 的大小的采样
+为了控制spark数据量的大小,通过采样,估算或者推测 AppendOnlyMap 未来的大小,从而控制.
+SizeTrackingAppendOnlyMap 继承了 SizeTracker;afterupdate方法用于每次更新 AppendOnlyMap的缓存后进行采样;采样前提是达到设定的采样间隔
+
+采样的步骤
+private def takeSample(): Unit = {
+  samples.enqueue(Sample(SizeEstimator.estimate(this), numUpdates))
+  // Only use the last two samples to extrapolate
+  if (samples.size > 2) {
+    samples.dequeue()
+  }
+  val bytesDelta = samples.toList.reverse match {
+    case latest :: previous :: tail =>
+      (latest.size - previous.size).toDouble / (latest.numUpdates - previous.numUpdates)
+    // If fewer than 2 samples, assume no change
+    case _ => 0
+  }
+  bytesPerUpdate = math.max(0, bytesDelta)
+  nextSampleNum = math.ceil(numUpdates * SAMPLE_GROWTH_RATE).toLong
+}
+
+将内存进行估算,于当前编号一起作为样本数据更新到samples中
+如果当前采样数量>2,执行dequeue,只留2个采样
+计算更新增加的大小;如果样本数<2,为0
+计算下次采样间隔nextSampleNum
+
+AppendOnlyMap的大小采样数据用于推测 AppendOnlyMap未来的大小;实际上是SizeTracker.scala的 estimateSize
+def estimateSize(): Long = {
+  assert(samples.nonEmpty)
+  val extrapolatedDelta = bytesPerUpdate * (numUpdates - samples.last.numUpdates)
+  (samples.last.size + extrapolatedDelta).toLong
+}
+限制内存中的容量,以防止内存溢出
+
+5.3.2 map端计算结果缓存
+ExternalSorter.scala的ExternalSorter类,insertAll方法中,if没有定义aggregator,也就是没定义聚合方法,那么就不用combine
+{
+  // Stick values into our buffer
+  while (records.hasNext) {
+    addElementsRead()
+    val kv = records.next()
+    buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C])
+    maybeSpillCollection(usingMap = false)
+  }
+}
+
+PartitionedPairBuffer.insert方法,把计算结果缓存到数组中
