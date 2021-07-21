@@ -309,3 +309,57 @@ ExternalSorter.scala中,定义的writePartitionedFile方法;用于持久化计�
 
 5.4.1 溢出分区文件
 createTempShuffleBlock方法略.getDiskWriter方法获取写入方法
+
+持久化方法:为每个临时文件最后,逐个读取并统一写入正式的block文件;
+每个partition生成的临时文件最后会逐个读取并统一写入正式的block文件->每个map任务实际上最后只会生成一个磁盘文件;多个bucket合并到一个文件中
+
+5.4.2 排序与分区分组
+partitionedIterator,通过对集合按照指定的比较器进行排序,并且按照partition id分组
+def partitionedIterator: Iterator[(Int, Iterator[Product2[K, C]])] = {
+  val usingMap = aggregator.isDefined
+  val collection: WritablePartitionedPairCollection[K, C] = if (usingMap) map else buffer
+  if (spills.isEmpty) {
+    // Special case: if we have only in-memory data, we don't need to merge streams, and perhaps
+    // we don't even need to sort by anything other than partition ID
+    // 只在内存中有时间,不用merge,甚至可能不需要通过除了partition ID之外的方式进行排序
+    if (!ordering.isDefined) {
+      // The user hasn't requested sorted keys, so only sort by partition ID, not key
+      // 用户不需要要求排序后的keys,因此只用通过partition ID排序,而不是key
+      groupByPartition(destructiveIterator(collection.partitionedDestructiveSortedIterator(None)))
+    } else {
+      // We do need to sort by both partition ID and key
+      // 既要ID,又要key
+      groupByPartition(destructiveIterator(
+        collection.partitionedDestructiveSortedIterator(Some(keyComparator))))
+    }
+  } else {
+    // Merge spilled and in-memory data
+    merge(spills, destructiveIterator(
+      collection.partitionedDestructiveSortedIterator(comparator)))
+  }
+}
+
+排序器:
+// 比较器,用来聚合或者排序的;可以是部分排序(相同keys有comparator.compare(k, k) = 0),如果没有全排序的话.
+// 一些不等keys也有这个,因此我们需要实现真相等的keys.
+// 注意,我们忽略了没有聚合器和排序方法的情况.
+private val keyComparator: Comparator[K] = ordering.getOrElse(new Comparator[K] {
+  override def compare(a: K, b: K): Int = {
+    val h1 = if (a == null) 0 else a.hashCode()
+    val h2 = if (b == null) 0 else b.hashCode()
+    if (h1 < h2) -1 else if (h1 == h2) 0 else 1 }})
+
+
+partitionedIterator方法中, groupByPartition(destructiveIterator(collection.partitionedDestructiveSortedIterator(None))) 是核心
+
+destructiveIterator方法的实现
+def destructiveIterator(memoryIterator: Iterator[((Int, K), C)]): Iterator[((Int, K), C)] = {
+  if (isShuffleSort) {
+    memoryIterator
+  } else {
+    readingIterator = new SpillableIterator(memoryIterator)
+    readingIterator
+  }
+}
+
+如果是shufflesort,就输出 memoryIterator;反之,用SpillableIterator
