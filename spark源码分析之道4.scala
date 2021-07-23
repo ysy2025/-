@@ -353,6 +353,7 @@ private val keyComparator: Comparator[K] = ordering.getOrElse(new Comparator[K] 
 partitionedIterator方法中, groupByPartition(destructiveIterator(collection.partitionedDestructiveSortedIterator(None))) 是核心
 
 destructiveIterator方法的实现
+这里是ExternalSorter.scala的destructiveIterator的实现方法
 def destructiveIterator(memoryIterator: Iterator[((Int, K), C)]): Iterator[((Int, K), C)] = {
   if (isShuffleSort) {
     memoryIterator
@@ -363,3 +364,86 @@ def destructiveIterator(memoryIterator: Iterator[((Int, K), C)]): Iterator[((Int
 }
 
 如果是shufflesort,就输出 memoryIterator;反之,用SpillableIterator
+
+AppendOnlyMap.scala中destructiveIterator的实现如下
+def destructiveSortedIterator(keyComparator: Comparator[K]): Iterator[(K, V)] = {
+  destroyed = true
+  // Pack KV pairs into the front of the underlying array
+  var keyIndex, newIndex = 0
+  while (keyIndex < capacity) {
+    if (data(2 * keyIndex) != null) {
+      data(2 * newIndex) = data(2 * keyIndex)
+      data(2 * newIndex + 1) = data(2 * keyIndex + 1)
+      newIndex += 1
+    }
+    keyIndex += 1
+  }
+  assert(curSize == newIndex + (if (haveNullValue) 1 else 0))
+  new Sorter(new KVArraySortDataFormat[K, AnyRef]).sort(data, 0, newIndex, keyComparator)
+  new Iterator[(K, V)] {
+    var i = 0
+    var nullValueReady = haveNullValue
+    def hasNext: Boolean = (i < newIndex || nullValueReady)
+    def next(): (K, V) = {
+      if (nullValueReady) {
+        nullValueReady = false
+        (null.asInstanceOf[K], nullValue)
+      } else {
+        val item = (data(2 * i).asInstanceOf[K], data(2 * i + 1).asInstanceOf[V])
+        i += 1
+        item
+      }
+    }
+  }
+}
+
+3,分区分组:groupByPartition
+主要用于针对destructiveSortedIterator生成的迭代器,按照partition id分组
+private def groupByPartition(data: Iterator[((Int, K), C)])
+    : Iterator[(Int, Iterator[Product2[K, C]])] =
+{
+  val buffered = data.buffered
+  (0 until numPartitions).iterator.map(p => (p, new IteratorForPartition(p, buffered)))
+  //每一个partition,转换成iterator,然后对每一个,都用IteratorForPartition
+}
+IteratorForPartition的实现如下
+private[this] class IteratorForPartition(partitionId: Int, data: BufferedIterator[((Int, K), C)])
+  extends Iterator[Product2[K, C]]
+{
+  override def hasNext: Boolean = data.hasNext && data.head._1._1 == partitionId
+  override def next(): Product2[K, C] = {
+    if (!hasNext) {
+      throw new NoSuchElementException
+    }
+    val elem = data.next()
+    (elem._1._2, elem._2)
+  }
+}
+
+5.4.3 分区索引文件
+无论哪种缓存处理,在持久化的时候都会写入统一文件;reduce如何从文件中按照分区读取数据呢?
+writeindexfile方法,会生成分区索引文件;此文件使用偏移量来区分各个分区的计算结果;偏移量是来自于合并排序过程中记录的各个partition的长度
+
+5.5 reduce端,读取中间计算结果
+下游,如何读取上游任务计算结果?
+ResultTask的计算,是由RDD的iterator方法驱动,最终计算过程会落实到ShuffledRDD的compute方法;
+override def compute(split: Partition, context: TaskContext): Iterator[(K, C)] = {
+  val dep = dependencies.head.asInstanceOf[ShuffleDependency[K, V, C]]
+  SparkEnv.get.shuffleManager.getReader(dep.shuffleHandle, split.index, split.index + 1, context)
+    .read()
+    .asInstanceOf[Iterator[(K, C)]]
+}
+首先,调用SortShuffleManager的getReader方法,创建HashShuffleReader;然后调用read方法,读取中间计算结果
+虽然我也不清楚,为什么新版本里面的getReader,穿透后是ShuffleManager.scala中的getReader,但是这里面的getReader是空的
+又怎么穿透到SortShuffleManager里面了
+
+override def getReader[K, C](
+    handle: ShuffleHandle,
+    startPartition: Int,
+    endPartition: Int,
+    context: TaskContext): ShuffleReader[K, C] = {
+  new BlockStoreShuffleReader(
+    handle.asInstanceOf[BaseShuffleHandle[K, _, C]], startPartition, endPartition, context)
+}
+
+老版本里面是 new HashShuffleReader, 新版本是 BlockStoreShuffleReader;
