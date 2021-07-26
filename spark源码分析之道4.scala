@@ -447,3 +447,175 @@ override def getReader[K, C](
 }
 
 老版本里面是 new HashShuffleReader, 新版本是 BlockStoreShuffleReader;
+
+BlockStoreShuffleReader.scala 脚本中,BlockStoreShuffleReader类, 主要内容就是 read方法的实现
+从远端或者本地读取中间计算结果
+对 InterruptibleIterator 执行聚合
+对 InterruptibleIterator 执行排序;用 ExternalSorter的insertAll
+
+从远端或者本地读取中间计算结果,使用 ShuffleBlockFetcherIterator来实现,而不是老版本的 BlockStoreShuffleFetcher的fetch方法实现
+具体实现方法见 spark.storage.ShuffleBlockFetcherIterator.scala 文件中
+
+5.5.1 获取map任务状态
+spark通过调用 getStatuses,而不是老版本的 getServerStatuses方法
+处理步骤:
+1,从当前BlockManager的MapOutPutTracker中获取MapStatus.如果没有,进入第二步;如果有,进入第四步
+2,如果获取列表中已经存在要取的shuffleId,那么就等待其他线程获取.如果获取列表中不存在要取的shuffleId,那么就将shuffleId放入获取列表
+3,调用askTracker,向MapOutputTrackerMasterActor发送 GetMapOutPutStatuses消息,获取map任务的状态信息. MapOutputTrackerMasterActor接收到消息后,将请求的map任务状态序列化后发送给请求方;然后反序列化
+4,没有status,就直接返回statuses
+
+protected def askTracker[T: ClassTag](message: Any): T = {
+  try {
+    trackerEndpoint.askSync[T](message)
+  } catch {
+    case e: Exception =>
+      logError("Error communicating with MapOutputTracker", e)
+      throw new SparkException("Error communicating with MapOutputTracker", e)
+  }
+}
+askTracker 的实现,如上.追踪
+def askSync[T: ClassTag](message: Any, timeout: RpcTimeout): T = {
+  val future = ask[T](message, timeout)
+  timeout.awaitResult(future)
+}
+
+处理status消息
+override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+  case GetMapOutputStatuses(shuffleId: Int) =>
+    val hostPort = context.senderAddress.hostPort
+    logInfo("Asked to send map output locations for shuffle " + shuffleId + " to " + hostPort)
+    val mapOutputStatuses = tracker.post(new GetMapOutputMessage(shuffleId, context))
+  case StopMapOutputTracker =>
+    logInfo("MapOutputTrackerMasterEndpoint stopped!")
+    context.reply(true)
+    stop()
+}
+
+转换 mapstatuses的实现如下:map 任务地址转换
+def convertMapStatuses(
+    shuffleId: Int,
+    startPartition: Int,
+    endPartition: Int,
+    statuses: Array[MapStatus]): Iterator[(BlockManagerId, Seq[(BlockId, Long)])] = {
+  assert (statuses != null)
+  val splitsByAddress = new HashMap[BlockManagerId, ListBuffer[(BlockId, Long)]]
+  for ((status, mapId) <- statuses.iterator.zipWithIndex) {
+    if (status == null) {
+      val errorMessage = s"Missing an output location for shuffle $shuffleId"
+      logError(errorMessage)
+      throw new MetadataFetchFailedException(shuffleId, startPartition, errorMessage)
+    } else {
+      for (part <- startPartition until endPartition) {
+        val size = status.getSizeForBlock(part)
+        if (size != 0) {
+          splitsByAddress.getOrElseUpdate(status.location, ListBuffer()) +=
+              ((ShuffleBlockId(shuffleId, mapId, part), size))
+        }
+      }
+    }
+  }
+  splitsByAddress.iterator
+}
+
+5.5.2 划分本地与远程Block
+ShuffleBlockFetcherIterator 是读取中间结果的关键
+在 BlockStoreShuffleReader.read方法中,val wrappedStreams = new ShuffleBlockFetcherIterator(...)
+构造 val wrappedStreams = new ShuffleBlockFetcherIterator时,会调用 ShuffleBlockFetcherIterator 类, 该类中调用 initialize方法;实现方法如下:
+private[this] def initialize(): Unit = {
+  // Add a task completion callback (called in both success case and failure case) to cleanup.
+  context.addTaskCompletionListener[Unit](_ => cleanup())
+  // Split local and remote blocks.
+  val remoteRequests = splitLocalRemoteBlocks()
+  // Add the remote requests into our queue in a random order
+  fetchRequests ++= Utils.randomize(remoteRequests)
+  assert ((0 == reqsInFlight) == (0 == bytesInFlight),
+    "expected reqsInFlight = 0 but found reqsInFlight = " + reqsInFlight +
+    ", expected bytesInFlight = 0 but found bytesInFlight = " + bytesInFlight)
+  // Send out initial requests for blocks, up to our maxBytesInFlight
+  fetchUpToMaxBytes()
+  val numFetches = remoteRequests.size - fetchRequests.size
+  logInfo("Started " + numFetches + " remote fetches in" + Utils.getUsedTimeMs(startTime))
+  // Get Local Blocks
+  fetchLocalBlocks()
+  logDebug("Got local blocks in " + Utils.getUsedTimeMs(startTime))
+}
+
+首先通过 val remoteRequests = splitLocalRemoteBlocks(), 初始化 拆分本地读取和远程读取Block的请求
+然后,将 fetchRequest 排序后存入 fetchRequests中
+遍历 fetchRequests, 远程请求Block中间结果
+调用 fetchLocalBlocks,获取本地Block
+
+splitLocalRemoteBlocks方法,时划分哪些Block从本地获取,哪些远程获取,时获取中间计算结果的关键
+实现方法如下:
+
+private[this] def splitLocalRemoteBlocks(): ArrayBuffer[FetchRequest] = {
+  // Make remote requests at most maxBytesInFlight / 5 in length; the reason to keep them
+  // smaller than maxBytesInFlight is to allow multiple, parallel fetches from up to 5
+  // nodes, rather than blocking on reading output from one node.
+  val targetRequestSize = math.max(maxBytesInFlight / 5, 1L)
+  logDebug("maxBytesInFlight: " + maxBytesInFlight + ", targetRequestSize: " + targetRequestSize
+    + ", maxBlocksInFlightPerAddress: " + maxBlocksInFlightPerAddress)
+  // Split local and remote blocks. Remote blocks are further split into FetchRequests of size
+  // at most maxBytesInFlight in order to limit the amount of data in flight.
+  val remoteRequests = new ArrayBuffer[FetchRequest]
+  for ((address, blockInfos) <- blocksByAddress) {
+    if (address.executorId == blockManager.blockManagerId.executorId) {
+      blockInfos.find(_._2 <= 0) match {
+        case Some((blockId, size)) if size < 0 =>
+          throw new BlockException(blockId, "Negative block size " + size)
+        case Some((blockId, size)) if size == 0 =>
+          throw new BlockException(blockId, "Zero-sized blocks should be excluded.")
+        case None => // do nothing.
+      }
+      localBlocks ++= blockInfos.map(_._1)
+      numBlocksToFetch += localBlocks.size
+    } else {
+      val iterator = blockInfos.iterator
+      var curRequestSize = 0L
+      var curBlocks = new ArrayBuffer[(BlockId, Long)]
+      while (iterator.hasNext) {
+        val (blockId, size) = iterator.next()
+        if (size < 0) {
+          throw new BlockException(blockId, "Negative block size " + size)
+        } else if (size == 0) {
+          throw new BlockException(blockId, "Zero-sized blocks should be excluded.")
+        } else {
+          curBlocks += ((blockId, size))
+          remoteBlocks += blockId
+          numBlocksToFetch += 1
+          curRequestSize += size
+        }
+        if (curRequestSize >= targetRequestSize ||
+            curBlocks.size >= maxBlocksInFlightPerAddress) {
+          // Add this FetchRequest
+          remoteRequests += new FetchRequest(address, curBlocks)
+          logDebug(s"Creating fetch request of $curRequestSize at $address "
+            + s"with ${curBlocks.size} blocks")
+          curBlocks = new ArrayBuffer[(BlockId, Long)]
+          curRequestSize = 0
+        }
+      }
+      // Add in the final request
+      if (curBlocks.nonEmpty) {
+        remoteRequests += new FetchRequest(address, curBlocks)
+      }
+    }
+  }
+  logInfo(s"Getting $numBlocksToFetch non-empty blocks including ${localBlocks.size}" +
+      s" local blocks and ${remoteBlocks.size} remote blocks")
+  remoteRequests
+}
+
+解释如下定义:
+targetRequestSize,每个远程请求的最大尺寸
+totalBlocks:统计Block总数
+localBlocks:缓存可以在本地获取的Block的blockId
+remoteBlocks:缓存需要远程获取的Block的Id
+curBlocks:远程获取的累加缓存,用于保证每个远程请求的尺寸不会太大不会太小
+curRequestSize:当前累加到curBlocks中的所有Block大小和
+remoteRequests,缓存需要远程请求的FetchRequest对象
+numBlocksToFetch:一共要获取的Block数量
+maxBytesInFlight:每次请求的最大字节数
+
+首先初始化基础定义
+遍历blockInfo,如果blockInfo所在的Executor与当前Executor相同,则将BlockId存入localBlock
