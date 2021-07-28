@@ -618,4 +618,150 @@ numBlocksToFetch:一共要获取的Block数量
 maxBytesInFlight:每次请求的最大字节数
 
 首先初始化基础定义
-遍历blockInfo,如果blockInfo所在的Executor与当前Executor相同,则将BlockId存入localBlock
+遍历blockInfo,如果blockInfo所在的Executor与当前Executor相同,则将BlockId存入localBlock;否则,将blockinfo的blockid和size累加到curblocks,将blockid存入remoteblocks,currequestsize增加size;
+每当currequestsize >= targetrequestsize,则信建fetchrequest,放入remoterequests;
+遍历结束,curblocks中如果仍然有缓存的,信建fetchrequest放入remoterequests;此次请求不受maxbytesinflight和targetrequestsize的影响
+
+5.5.3 获取远程block
+sendrequest方法中,用于远程请求中间结果;sendrequest利用fetchrequest封装的blockid,size,address等,调用shuffleclient的fetchblocks方法获取结果
+private[this] def sendRequest(req: FetchRequest) {
+  logDebug("Sending request for %d blocks (%s) from %s".format(
+    req.blocks.size, Utils.bytesToString(req.size), req.address.hostPort))
+  bytesInFlight += req.size
+  reqsInFlight += 1
+  // so we can look up the size of each blockID
+  val sizeMap = req.blocks.map { case (blockId, size) => (blockId.toString, size) }.toMap
+  val remainingBlocks = new HashSet[String]() ++= sizeMap.keys
+  val blockIds = req.blocks.map(_._1.toString)
+  val address = req.address
+  val blockFetchingListener = new BlockFetchingListener {
+    override def onBlockFetchSuccess(blockId: String, buf: ManagedBuffer): Unit = {
+      // Only add the buffer to results queue if the iterator is not zombie,
+      // i.e. cleanup() has not been called yet.
+      ShuffleBlockFetcherIterator.this.synchronized {
+        if (!isZombie) {
+          // Increment the ref count because we need to pass this to a different thread.
+          // This needs to be released after use.
+          buf.retain()
+          remainingBlocks -= blockId
+          results.put(new SuccessFetchResult(BlockId(blockId), address, sizeMap(blockId), buf,
+            remainingBlocks.isEmpty))
+          logDebug("remainingBlocks: " + remainingBlocks)
+        }
+      }
+      logTrace("Got remote block " + blockId + " after " + Utils.getUsedTimeMs(startTime))
+    }
+    override def onBlockFetchFailure(blockId: String, e: Throwable): Unit = {
+      logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
+      results.put(new FailureFetchResult(BlockId(blockId), address, e))
+    }
+  }
+  // Fetch remote shuffle blocks to disk when the request is too large. Since the shuffle data is
+  // already encrypted and compressed over the wire(w.r.t. the related configs), we can just fetch
+  // the data and write it to file directly.
+  if (req.size > maxReqSizeShuffleToMem) {
+    shuffleClient.fetchBlocks(address.host, address.port, address.executorId, blockIds.toArray,
+      blockFetchingListener, this)
+  } else {
+    shuffleClient.fetchBlocks(address.host, address.port, address.executorId, blockIds.toArray,
+      blockFetchingListener, null)
+  }
+}
+
+首先,初始化sizemap,remainingblocks,blockids,aadress等参数,然后,初始化 blockFetchingListener 监听器
+然后,利用 shuffleClient.fetchBlocks 来获取其他节点上的中间计算结果
+
+5.5.4 获取本地Block
+fetchLocalBlocks,用于对本地中间计算结果的获取;fetchLocalBlocks方法的实现:
+private[this] def fetchLocalBlocks() {
+  logDebug(s"Start fetching local blocks: ${localBlocks.mkString(", ")}")
+  val iter = localBlocks.iterator
+  while (iter.hasNext) {
+    val blockId = iter.next()
+    try {
+      val buf = blockManager.getBlockData(blockId)
+      shuffleMetrics.incLocalBlocksFetched(1)
+      shuffleMetrics.incLocalBytesRead(buf.size)
+      buf.retain()
+      results.put(new SuccessFetchResult(blockId, blockManager.blockManagerId,
+        buf.size(), buf, false))
+    } catch {
+      case e: Exception =>
+        // If we see an exception, stop immediately.
+        logError(s"Error occurred while fetching local blocks", e)
+        results.put(new FailureFetchResult(blockId, blockManager.blockManagerId, e))
+        return
+    }
+  }
+}
+初始化迭代器;初始化blockid;
+尝试利用blockManager.getBlockData获取数据
+然后将中间结果存入results中
+
+5.6 reduce端计算
+5.6.1 如何同时处理多个map任务的中间结果
+reduce上游,map任务可能有多个;根据分析,中间结果的block和缓存在 ShuffleBlockFetcherIterator的results中去读数据
+
+每次迭代,会先从results中取出一个fetchresult,然后构建迭代器
+  override def hasNext: Boolean = numBlocksProcessed < numBlocksToFetch
+
+5.6.2 reduce端,在缓存中,对中间计算结果执行聚合和排序
+read方法中,有 combineCombinersByKey方法;reduce端获取map任务计算中间结果时,将 ShuffleBlockFetcherIterator封装
+然后通过 dep.aggregator.get.combineCombinersByKey(combinedKeyValuesIterator, context)
+def combineCombinersByKey(
+    iter: Iterator[_ <: Product2[K, C]],
+    context: TaskContext): Iterator[(K, C)] = {
+  val combiners = new ExternalAppendOnlyMap[K, C, C](identity, mergeCombiners, mergeCombiners)
+  combiners.insertAll(iter)
+  updateMetrics(context, combiners)
+  combiners.iterator
+}
+
+使用 ExternalAppendOnlyMap, 完成聚合
+然后调用 ExternalAppendOnlyMap.insertAll;ExternalAppendOnlyMap.iterator等
+其实质,也是使用 SizeTrackingAppendOnlyMap.
+def insertAll(entries: Iterator[Product2[K, V]]): Unit = {
+  if (currentMap == null) {
+    throw new IllegalStateException(
+      "Cannot insert new elements into a map after calling iterator")
+  }
+  // An update function for the map that we reuse across entries to avoid allocating
+  // a new closure each time
+  var curEntry: Product2[K, V] = null
+  val update: (Boolean, C) => C = (hadVal, oldVal) => {
+    if (hadVal) mergeValue(oldVal, curEntry._2) else createCombiner(curEntry._2)
+  }
+  while (entries.hasNext) {
+    curEntry = entries.next()
+    val estimatedSize = currentMap.estimateSize()
+    if (estimatedSize > _peakMemoryUsedBytes) {
+      _peakMemoryUsedBytes = estimatedSize
+    }
+    if (maybeSpill(currentMap, estimatedSize)) {
+      currentMap = new SizeTrackingAppendOnlyMap[K, C]
+    }
+    currentMap.changeValue(curEntry._1, update)
+    addElementsRead()
+  }
+}
+
+5.7 map端和reduce端组合分析
+5.7.1 在map端溢出分区文件;在reduce端合并组合
+bypassMergeSort,标记是否传递到reduce端,再合并排序->不用缓存,而是将数据按照partition写入不同文件,最后按照partition顺序合并写入同一文件;当没有指定聚合,排序函数,而且partition数量较小时
+将多个bucket合并到同一个文件,减少map输出文件数量,节省磁盘IO,提升系统性能
+5.7.2 map端,简单缓存,排序分组,reduce端合并组合
+缓存中,利用指定的排序函数,对数据按照partition或者key排序,最后按照partition顺序合并写入同一文件;没有指定聚合函数而且partition数量大时
+多个bucket合并到一个文件中,通过减少map输出的文件数量,节省磁盘IO,提升系统性能
+5.7.3 在map端聚合排序分组,在reduce端组合
+缓存中,按照key聚合,利用指定的排序函数,对数据按照partition或者key排序,最后按照partition顺序,合并写入同一个文件.当指定了聚合函数时,一般采用这种方式
+多个bucket合并到一个文件中,减少map输出文件数量,节省磁盘IO,提升系统性能;对中间输出数据不是一次性读取,而是逐条放入 appendonlymap的缓存,并且对数据进行聚合,减少了中间结果占用的内存大小
+对 appendonlymap 的缓存进行溢出判断,超过内存大小时,写入磁盘
+
+
+5.8 小结
+RDD迭代计算,如何容错?缓存和检查点
+map任务时如何聚合的?使用 appendonlymap 提供的数据结构来实现聚合
+为什么有什么要在map端聚合?为了降低网络IO,提升系统性能
+map任务如何输出?按照分区排序或者分组后,生成分区文件
+reduce任务,如何获取map端的任务的输出的?通过mapoutputtracker获取map任务所在executor的blockmanagerid和block的大小,然后通过shuffleclient下载
+发送请求时,如何优化性能?对请求分批发送,限制分批请求大小,并行发送,将多个请求数据小的请求合并等
