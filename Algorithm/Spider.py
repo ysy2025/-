@@ -21,6 +21,12 @@ def getHTMLText(url):
     except:
         return ''
 
+def getUrlIndexs(content):
+    lines = content.split('\n')
+    potential_indexs = [i for i in lines if "index" in i]
+    indexes = ["https://www.tujigu.com" + i.split('"')[1] for i in potential_indexs]
+    return sorted(list(set(indexes)))
+
 def getUrlLinks(target, content):
     lines = content.split('\n')
     potential_links = [i.split('"')[3] for i in lines if (target in i and "href" in i and "No." in i)]
@@ -59,37 +65,57 @@ def downloadimage(url, path):
     ##下载大图和带水印的高质量大图
     r = requests.get(url)
     print(r.status_code)
-    if(r.status_code!=200):
+    if(r.status_code==200):
         r=requests.get(url)
+        # 如果已经有了,就删除
+        if os.path.exists(path):
+            print("already exists!")
+            os.remove(path)
         with open(path, 'wb') as f:
             f.write(r.content)
             print("下载成功")
 
 if __name__ == '__main__':
-    url = "https://www.tujigu.com/t/437/"
-    content = getHTMLText(url)
+    open_url = "https://www.tujigu.com/t/437/"
+    # open_url = "https://www.tujigu.com/t/1194/"
+    open_content = getHTMLText(open_url)
     target = "就是阿朱啊"
-    #获取到了全部链接
-    potential_links = getUrlLinks(target, content)
-    print(potential_links)
-    #针对每个获取进一步的图
-    """
-    首先,获取链接,然后获取网页数量
-    每个链接,都是有下一页,下一页,因此需要构建多个网页
-    """
-    for sublink in potential_links[:1]:
-        content_sublink = getHTMLText(sublink)
-        potential_sub_links = getUrlPages(content_sublink)
+    local_path_pre = "E:\\data\\Pics\\azhu\\"
+
+    #首先获取所有index
+    urls = getUrlIndexs(open_content)
+    print(urls)
+
+    urls.insert(0, open_url)
+    print(urls)
+    for url in urls:
+        #针对每个url,进行如下处理
+        #获取到了全部链接
+        content = getHTMLText(url)
+        potential_links = getUrlLinks(target, content)
+        print(potential_links)
+        #针对每个获取进一步的图
         """
-        获取了网页链接后,可以获取图片链接了
+        首先,获取链接,然后获取网页数量
+        每个链接,都是有下一页,下一页,因此需要构建多个网页
         """
-        for each_link in potential_sub_links[:1]:
-            print(each_link)
-            each_link_text = each_link.split("/")[-1].split(".")[0]
-            number = 0 if each_link_text == '' else int(each_link_text)
-            print(number)
-            #准备工作完毕,开始解析"https://www.tujigu.com/a/44656/"网页
-            each_link_content = getHTMLText(each_link)
-            each_link_content_links = getPicLinks(target, each_link_content)
-            print(each_link_content_links)
-            print(len(each_link_content_links))
+        for sublink in potential_links:
+            content_sublink = getHTMLText(sublink)
+            potential_sub_links = getUrlPages(content_sublink)
+            print(potential_sub_links)
+            """
+            获取了网页链接后,可以获取图片链接了
+            """
+            for each_link in potential_sub_links:
+                print(each_link)
+                each_link_text = each_link.split("/")[-1].split(".")[0]
+                number = 1 if each_link_text == '' else int(each_link_text)
+                print(number)
+                #准备工作完毕,开始解析"https://www.tujigu.com/a/44656/"网页
+                each_link_content = getHTMLText(each_link)
+                each_link_content_links = getPicLinks(target, each_link_content)
+                print(each_link_content_links)
+                print(len(each_link_content_links))
+                for each_link_content_link in each_link_content_links:
+                    path = local_path_pre + target + '_' + each_link_content_link.split('/')[-2] + '_' + str(number) + '_' + each_link_content_link.split('/')[-1]
+                    downloadimage(each_link_content_link, path)
