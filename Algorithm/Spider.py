@@ -76,11 +76,11 @@ def downloadimage(url, path):
             print("下载成功")
 
 if __name__ == '__main__':
-    open_url = "https://www.tujigu.com/t/437/"
-    # open_url = "https://www.tujigu.com/t/1194/"
+    # open_url = "https://www.tujigu.com/t/437/"
+    open_url = "https://www.tujigu.com/t/5981/"
     open_content = getHTMLText(open_url)
-    target = "就是阿朱啊"
-    local_path_pre = "E:\\data\\Pics\\azhu\\"
+    target = "李夫人"
+    local_path_pre = "E:\\Learning\\data\\Pics\\lfr\\"
 
     #首先获取所有index
     urls = getUrlIndexs(open_content)
