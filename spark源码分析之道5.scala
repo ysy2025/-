@@ -87,17 +87,76 @@ def start(): Array[String] = {
 首先,disable rest 服务器;然后启动master;启动worker;返回master
 
 启动master
-def startRpcEnvAndEndpoint(
-    host: String,
-    port: Int,
-    webUiPort: Int,
-    conf: SparkConf): (RpcEnv, Int, Option[Int]) = {
-  val securityMgr = new SecurityManager(conf)
-  val rpcEnv = RpcEnv.create(SYSTEM_NAME, host, port, conf, securityMgr)
-  val masterEndpoint = rpcEnv.setupEndpoint(ENDPOINT_NAME,
-    new Master(rpcEnv, rpcEnv.address, webUiPort, securityMgr, conf))
-  val portsResponse = masterEndpoint.askSync[BoundPortsResponse](BoundPortsRequest)
-  (rpcEnv, portsResponse.webUIPort, portsResponse.restPort)
+Master.scala中的 onStart()方法;
+
+这一块,首先初始化 securityMgr,rpcEnv,masterEndpoint等
+
+private def timeOutDeadWorkers() {
+  // Copy the workers into an array so we don't modify the hashset while iterating through it
+  val currentTime = System.currentTimeMillis()
+  val toRemove = workers.filter(_.lastHeartbeat < currentTime - WORKER_TIMEOUT_MS).toArray
+  for (worker <- toRemove) {
+    if (worker.state != WorkerState.DEAD) {
+      logWarning("Removing %s because we got no heartbeat in %d seconds".format(
+        worker.id, WORKER_TIMEOUT_MS / 1000))
+      removeWorker(worker)
+    } else {
+      if (worker.lastHeartbeat < currentTime - ((REAPER_ITERATIONS + 1) * WORKER_TIMEOUT_MS)) {
+        workers -= worker // we've seen this DEAD worker in the UI, etc. for long enough; cull it
+      }
+    }
+  }
+}
+初始化 超时的失效的工作节点
+需要remove的标准:上一次心跳的时间间距超过汇报时间
+如果workerinfo的状态不是dead,等待时间,移除;然后,根据心跳,来干掉worker
+
+private def removeWorker(worker: WorkerInfo) {
+  logInfo("Removing worker " + worker.id + " on " + worker.host + ":" + worker.port)
+  worker.setState(WorkerState.DEAD)
+  idToWorker -= worker.id
+  addressToWorker -= worker.endpoint.address
+  if (reverseProxy) {
+    webUi.removeProxyTargets(worker.id)
+  }
+  for (exec <- worker.executors.values) {
+    logInfo("Telling app of lost executor: " + exec.id)
+    exec.application.driver.send(ExecutorUpdated(
+      exec.id, ExecutorState.LOST, Some("worker lost"), None, workerLost = true))
+    exec.state = ExecutorState.LOST
+    exec.application.removeExecutor(exec)
+  }
+  for (driver <- worker.drivers.values) {
+    if (driver.desc.supervise) {
+      logInfo(s"Re-launching ${driver.id}")
+      relaunchDriver(driver)
+    } else {
+      logInfo(s"Not re-launching ${driver.id} because it was not supervised")
+      removeDriver(driver.id, DriverState.ERROR, None)
+    }
+  }
+  persistenceEngine.removeWorker(worker)
 }
 
-这一块,首先初始
+private def removeDriver(
+    driverId: String,
+    finalState: DriverState,
+    exception: Option[Exception]) {
+  drivers.find(d => d.id == driverId) match {
+    case Some(driver) =>
+      logInfo(s"Removing driver: $driverId")
+      drivers -= driver
+      if (completedDrivers.size >= RETAINED_DRIVERS) {
+        val toRemove = math.max(RETAINED_DRIVERS / 10, 1)
+        completedDrivers.trimStart(toRemove)
+      }
+      completedDrivers += driver
+      persistenceEngine.removeDriver(driver)
+      driver.state = finalState
+      driver.exception = exception
+      driver.worker.foreach(w => w.removeDriver(driver))
+      schedule()
+    case None =>
+      logWarning(s"Asked to remove unknown driver: $driverId")
+  }
+}
