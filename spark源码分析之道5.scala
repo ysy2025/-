@@ -59,6 +59,9 @@ SparkContext.scala中,createTaskScheduler方法,里面的master,根据不同情�
 最后输出 (backend, scheduler)
 
 6.2.1 LocalSparkCluster的启动
+
+LocalSparkCluster.scala中有实现方式
+
 masterActorSystems:用于缓存所有的Master的ActorSystem;
 workerActorSystems:维护所有的worker的actorsystem
 LocalSparkCluster的start方法用来创建启动master的actorsystem,与多个worker的actorsystem;
@@ -110,6 +113,13 @@ private def timeOutDeadWorkers() {
 初始化 超时的失效的工作节点
 需要remove的标准:上一次心跳的时间间距超过汇报时间
 如果workerinfo的状态不是dead,等待时间,移除;然后,根据心跳,来干掉worker
+启动webUI,masterMetricSystem,applicationMetricsSystem,然后给masterMetricsSystem和applicationMetricsSystem
+创建servletcontexthandler并且注册到webUI
+选择持久化引擎
+选择领导选举代理;
+
+收到electedleader后,会进行选举操作
+
 
 private def removeWorker(worker: WorkerInfo) {
   logInfo("Removing worker " + worker.id + " on " + worker.host + ":" + worker.port)
@@ -160,3 +170,117 @@ private def removeDriver(
       logWarning(s"Asked to remove unknown driver: $driverId")
   }
 }
+
+Master.scala中的实现
+case ElectedLeader =>
+      val (storedApps, storedDrivers, storedWorkers) = persistenceEngine.readPersistedData(rpcEnv)
+      state = if (storedApps.isEmpty && storedDrivers.isEmpty && storedWorkers.isEmpty) {
+        RecoveryState.ALIVE
+      } else {
+        RecoveryState.RECOVERING
+      }
+      logInfo("I have been elected leader! New state: " + state)
+      if (state == RecoveryState.RECOVERING) {
+        beginRecovery(storedApps, storedDrivers, storedWorkers)
+        recoveryCompletionTask = forwardMessageThread.schedule(new Runnable {
+          override def run(): Unit = Utils.tryLogNonFatalError {
+            self.send(CompleteRecovery)
+          }
+        }, WORKER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+      }
+
+ElectedLeader,首先获取 storedApps, storedDrivers, storedWorkers
+然后,获取状态
+如果需要恢复,那么开始恢复
+完成后有提示
+
+beginRecovery的实现也在Master.scala中
+private def beginRecovery(storedApps: Seq[ApplicationInfo], storedDrivers: Seq[DriverInfo],
+    storedWorkers: Seq[WorkerInfo]) {
+  for (app <- storedApps) {
+    logInfo("Trying to recover app: " + app.id)
+    try {
+      registerApplication(app)
+      app.state = ApplicationState.UNKNOWN
+      app.driver.send(MasterChanged(self, masterWebUiUrl))
+    } catch {
+      case e: Exception => logInfo("App " + app.id + " had exception on reconnect")
+    }
+  }
+  for (driver <- storedDrivers) {
+    // Here we just read in the list of drivers. Any drivers associated with now-lost workers
+    // will be re-launched when we detect that the worker is missing.
+    drivers += driver
+  }
+  for (worker <- storedWorkers) {
+    logInfo("Trying to recover worker: " + worker.id)
+    try {
+      registerWorker(worker)
+      worker.state = WorkerState.UNKNOWN
+      worker.endpoint.send(MasterChanged(self, masterWebUiUrl))
+    } catch {
+      case e: Exception => logInfo("Worker " + worker.id + " had exception on reconnect")
+    }
+  }
+}
+
+首先,针对storedApps的每一个app,尝试注册app,然后初始化app.state,app的driver发送信息
+对于driver,增加driver
+然后对于storedworkers的每一个worker,尝试注册worker,获取worker状态,利用endpoint发送信息
+
+启动worker
+创建,启动worker的actorsystem;每个worker的actorsystem都要注册自身的worker;
+同时每个worker的actorsystem都要注册到workeractorsystems缓存
+
+注册worker时,触发 onStart
+订阅remotinglifecycleevent,坚挺远程客户端断开连接
+创建工作目录;启动shuffleservice
+创建workerwebui,然后启动
+将worker注册到master
+启动metricssystem
+
+registerWithMaster(),是为了将worker注册到master中;调用tryRegisterAllMasters()方法
+private def tryRegisterAllMasters(): Array[JFuture[_]] = {
+  masterRpcAddresses.map { masterAddress =>
+    registerMasterThreadPool.submit(new Runnable {
+      override def run(): Unit = {
+        try {
+          logInfo("Connecting to master " + masterAddress + "...")
+          val masterEndpoint = rpcEnv.setupEndpointRef(masterAddress, Master.ENDPOINT_NAME)
+          sendRegisterMessageToMaster(masterEndpoint)
+        } catch {
+          case ie: InterruptedException => // Cancelled
+          case NonFatal(e) => logWarning(s"Failed to connect to master $masterAddress", e)
+        }
+      }
+    })
+  }
+}
+
+master收到registerworker消息后,处理步骤:
+创建workerinfo
+注册workerinfo
+向worker发送registeredworker消息,表示注册完成
+调用schedule方法进行资源调度
+
+注册workerinfo,其实就是将其添加到workersHashSet[WorkerInfo]中,并且更新worker id和worker以及workeraddress等
+
+worker接受registeredworker消息的处理逻辑,步骤:
+标记注册成功
+调用changeMaster方法,更新activeMasterUrl等状态
+启动定时调度,给自己发送sendheartbeat消息
+
+master收到heartbeat消息后的实现也在Master中
+
+local-cluster模式下,有一个Master和多个worker,位于同一个JVM,通过各自启动的actorsystem通信
+
+6.2.2 CoarseGrainedSchedulerBackend启动
+local-cluster模式,除了创建TaskScheduler的时候与local不同,启动taskScheduler时,也不同
+local-cluster模式中,backend为SparkDeploySchedulerBackend.
+
+CoarseGrainedSchedulerBackend的start方法的执行过程如下:
+调用父类 CoarseGrainedSchedulerBackend 的start方法;
+进行参数,Java选项,类路径的设置
+
+启动AppClient
+主要用来代表Application和Master通信
