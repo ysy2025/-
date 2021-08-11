@@ -282,5 +282,95 @@ CoarseGrainedSchedulerBackend的start方法的执行过程如下:
 调用父类 CoarseGrainedSchedulerBackend 的start方法;
 进行参数,Java选项,类路径的设置
 
-启动AppClient
+启动AppClient;新版本中应该是 StandaloneAppClient
 主要用来代表Application和Master通信
+appclient启动时,会向driver的actorsystem注册clientactor
+
+向ActorSystem注册时,先调用prestart方法;
+override def onStart(): Unit = {
+  try {
+    registerWithMaster(1)
+  } catch {
+    case e: Exception =>
+      logWarning("Failed to connect to master", e)
+      markDisconnected()
+      stop()
+  }
+}
+
+registerWithMaster,有nthretry=1,说明重试1此
+private def registerWithMaster(nthRetry: Int) {
+  registerMasterFutures.set(tryRegisterAllMasters())
+  registrationRetryTimer.set(registrationRetryThread.schedule(new Runnable {
+    override def run(): Unit = {
+      if (registered.get) {
+        registerMasterFutures.get.foreach(_.cancel(true))
+        registerMasterThreadPool.shutdownNow()
+      } else if (nthRetry >= REGISTRATION_RETRIES) {
+        markDead("All masters are unresponsive! Giving up.")
+      } else {
+        registerMasterFutures.get.foreach(_.cancel(true))
+        registerWithMaster(nthRetry + 1)
+      }
+    }
+  }, REGISTRATION_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+}
+
+首先设置重试次数;设置线程
+
+创建applicationinfo的实现如下
+private def createApplication(desc: ApplicationDescription, driver: RpcEndpointRef):
+    ApplicationInfo = {
+  val now = System.currentTimeMillis()
+  val date = new Date(now)
+  val appId = newApplicationId(date)
+  new ApplicationInfo(now, appId, desc, date, driver, defaultCores)
+}
+
+ApplicationInfo.scala中的实现,调用了init方法
+private def init() {
+  state = ApplicationState.WAITING
+  executors = new mutable.HashMap[Int, ExecutorDesc]
+  coresGranted = 0
+  endTime = -1L
+  appSource = new ApplicationSource(this)
+  nextExecutorId = 0
+  removedExecutors = new ArrayBuffer[ExecutorDesc]
+  executorLimit = desc.initialExecutorLimit.getOrElse(Integer.MAX_VALUE)
+}
+声明了一系列参数
+
+注册application时:
+private def registerApplication(app: ApplicationInfo): Unit = {
+  val appAddress = app.driver.address
+  if (addressToApp.contains(appAddress)) {
+    logInfo("Attempted to re-register application at same address: " + appAddress)
+    return
+  }
+  applicationMetricsSystem.registerSource(app.appSource)
+  apps += app
+  idToApp(app.id) = app
+  endpointToApp(app.driver) = app
+  addressToApp(appAddress) = app
+  waitingApps += app
+}
+更新各种关系,包括appid, appdriver, appaddress等
+
+
+向standaloneclientactor发送注册消息后,
+case RegisteredApplication(appId_, masterRef) =>
+  // FIXME How to handle the following cases?
+  // 1. A master receives multiple registrations and sends back multiple
+  // RegisteredApplications due to an unstable network.
+  // 2. Receive multiple RegisteredApplication from different masters because the master is
+  // changing.
+  appId.set(appId_)
+  registered.set(true)
+  master = Some(masterRef)
+  listener.connected(appId.get)
+更新appid;标识当前application注册到maser;
+调用connected方法,更新appId,调用notifycontext方法标识application注册完成
+
+6.2.4 资源调度
+master,worker,application的启动和注册,executor是计算资源,但是好像没有体现.executor是什么时候创建的?application又是什么时候和executor取得联系的?
+executor什么时候分给application处理任务的?
