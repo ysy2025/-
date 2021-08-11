@@ -374,3 +374,51 @@ case RegisteredApplication(appId_, masterRef) =>
 6.2.4 资源调度
 master,worker,application的启动和注册,executor是计算资源,但是好像没有体现.executor是什么时候创建的?application又是什么时候和executor取得联系的?
 executor什么时候分给application处理任务的?
+
+老版本的schedule方法,现在的版本是startExecutorsOnWorkers
+private def startExecutorsOnWorkers(): Unit = {
+  // Right now this is a very simple FIFO scheduler. We keep trying to fit in the first app
+  // in the queue, then the second app, etc.
+  for (app <- waitingApps if app.coresLeft > 0) {
+    val coresPerExecutor: Option[Int] = app.desc.coresPerExecutor
+    // Filter out workers that don't have enough resources to launch an executor
+    val usableWorkers = workers.toArray.filter(_.state == WorkerState.ALIVE)
+      .filter(worker => worker.memoryFree >= app.desc.memoryPerExecutorMB &&
+        worker.coresFree >= coresPerExecutor.getOrElse(1))
+      .sortBy(_.coresFree).reverse
+    val assignedCores = scheduleExecutorsOnWorkers(app, usableWorkers, spreadOutApps)
+    // Now that we've decided how many cores to allocate on each worker, let's allocate them
+    for (pos <- 0 until usableWorkers.length if assignedCores(pos) > 0) {
+      allocateWorkerResourceToExecutors(
+        app, assignedCores(pos), coresPerExecutor, usableWorkers(pos))
+    }
+  }
+}
+
+资源调度两个步骤:逻辑分配,物理分配
+
+计算资源,逻辑分配;对cpu进行分配;将当前application的cpu核数需求分配到所有worker,内存不满足的过滤掉
+1,过滤处所有可用的worker
+2,对于过滤得到的worker按照其空闲内核数倒序排列
+3,实际需要分配的内核数=min(application需要的内核数,过滤后空闲内核数之和)
+4,如果需要分配的内核>0,逐个从worker中分配直到最后worker;然后从头再次轮询分配;直到application需要内核=0
+
+计算资源物理分配
+给application物理分配worker的内存和核数
+
+addExecutor,ApplicationInfo.scala中的实现
+
+然后,调用master的launchExecutor方法来实现;
+
+worker收到launchexecutor消息后的处理逻辑:Worker.scala中的 case LaunchExecutor(masterUrl, appId, execId, appDesc, cores_, memory_)
+创建executor的工作目录
+创建application的工作目录;当application完成时,此目录会被删除
+创建并启动executorrunner
+向master发送executorstatechanged消息
+
+启动ExecutorRunner的时候实际创建了线程workerThread和shutdownHook;
+ExecutorRunner.scala中实现的
+
+workerThread执行过程中,主要调用了 fetchAndRunExecutor 方法;ExecutorRunner.scala中的实现如下
+
+CoarseGrainedExecutorBackend.scala
