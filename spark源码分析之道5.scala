@@ -446,3 +446,58 @@ override def onStart() {
 }
 发送registeredexecutor消息
 1,发送registeredexecutor消息,收到后,创建executor
+2,worker接到launchexecutor消息后,创建executor目录,创建application本地目录,创建并启动executorrunner;最后向master发送executorstatechanged
+3,executorrunner创建并运行线程workerthread
+4,coarsegrainedexecutorbackend进程向driver发送 retrievesparkprops
+5,driver收到retrievesparkprops 消息后,向 coarsegrainedexecutorbackend 进程发送spark属性;coarsegrainedexecutorbackend进程最后创建自身需要的actorsystem
+6,coarsegrainedexecutorbackend 进程向actorsystem注册 coarsegrainedexecutorbackend,触发onstart,coarsegrainedexecutorbackend,onstart方法,向driveractor发送registerexecutor消息
+7,driveractor接到registerexecutor消息后,先向 coarsegrainedexecutorbackend 发送registeredexecutor消息,更新executor信息等;注册到driver的executor的总数,创建executordata并且注册到map中
+8,coarsegrainedexecutorbackend,收到registeredexecutor消息后创建executor
+9,coarsegrainedexecutorbackend 进程向刚刚启动的actorsystem注册workerwatcher,注册workerwatcher时候触发onstart;然后向sendheartbeat消息初始化连接
+10,worker收到 sendheartbeat消息后,向master发送heatbeat消息;master收到heartbeat消息后,如果发现worker没有注册过,则向worker发送 reconnectworker消息,要求worker重新想master注册
+
+6.2.5 local-cluster模式的任务执行
+
+所有的 actor-> Endpoint
+
+driveractor->driverEndpoint
+
+发送reviveoffers到 driverEndpoint;
+driverEndpoint类,在 coarsegrainedschedulerbackend中;
+收到消息后,调用 makeoffers
+makeoffers的实现,也在 coarsegrainedschedulerbackend.scala 中
+需要确保,在运行的时候,没有executors被杀掉
+private def makeOffers() {
+  // Make sure no executor is killed while some task is launching on it
+  val taskDescs = CoarseGrainedSchedulerBackend.this.synchronized {
+    // Filter out executors under killing
+    val activeExecutors = executorDataMap.filterKeys(executorIsAlive)
+    val workOffers = activeExecutors.map { case (id, executorData) =>
+      new WorkerOffer(id, executorData.executorHost, executorData.freeCores)
+    }.toIndexedSeq
+    scheduler.resourceOffers(workOffers)
+  }
+  if (!taskDescs.isEmpty) {
+    launchTasks(taskDescs)
+  }
+}
+首先,过滤掉active的executors;
+将executordata,转换为workeroffer;
+利用resourceoffers,给当前任务分配executor
+如果taskdescs非空,调用launchtasks
+
+调用 launchtasks,返回一系列 resource offers
+1,序列化 TaskDescription;
+2,取出 ExecutorData信息;将executordata描述的空闲cpu-任务占用的核数
+3,向 executor所在 CoarseGrainedExecutorBackend 发送launchtask信息
+
+收到 LaunchTask后,走
+case LaunchTask(data) =>
+  if (executor == null) {
+    exitExecutor(1, "Received LaunchTask command but executor was null")
+  } else {
+    val taskDesc = TaskDescription.decode(data.value)
+    logInfo("Got assigned task " + taskDesc.taskId)
+    executor.launchTask(this, taskDesc)
+  }
+反序列化,然后launchtask
