@@ -29,7 +29,8 @@ def getUrlIndexs(content):
 
 def getUrlLinks(target, content):
     lines = content.split('\n')
-    potential_links = [i.split('"')[3] for i in lines if (target in i and "href" in i and "No." in i)]
+    #potential_links = [i.split('"')[3] for i in lines if (target in i and "href" in i and "No." in i)]
+    potential_links = [i.split('"')[3] for i in lines if (target in i and "href" in i)]
     return potential_links
 
 def getUrlPages(content):
@@ -46,7 +47,8 @@ def getUrlPages(content):
 
 def getPicLinks(target, content):
     lines = content.split('\n')
-    links = [i.split('"') for i in lines if (target in i and i.startswith("<img src=") and "No." in i)]
+    # links = [i.split('"') for i in lines if (target in i and i.startswith("<img src=") and "No." in i)]
+    links = [i.split('"') for i in lines if (target in i and i.startswith("<img src="))]
     potential_links = [i for i in links[0] if i.startswith("https:")]
     return potential_links
 
@@ -77,11 +79,11 @@ def downloadimage(url, path):
 
 if __name__ == '__main__':
     # open_url = "https://www.tujigu.com/t/437/"
-    open_url = "https://www.tujigu.com/t/5981/"
+    open_url = "https://www.tujigu.com/a/5229/"
     open_content = getHTMLText(open_url)
-    target = "李夫人"
-    local_path_pre = "E:\\Learning\\data\\Pics\\lfr\\"
-
+    target = "Anna"
+    local_path_pre = "E:\\Learning\\data\\Pics\\Anna\\"
+    mkdir(local_path_pre)
     #首先获取所有index
     urls = getUrlIndexs(open_content)
     print(urls)

@@ -421,4 +421,28 @@ ExecutorRunner.scala中实现的
 
 workerThread执行过程中,主要调用了 fetchAndRunExecutor 方法;ExecutorRunner.scala中的实现如下
 
-CoarseGrainedExecutorBackend.scala
+CoarseGrainedExecutorBackend.scala main方法
+调用了run方法
+1,初始化log
+2,获取各种spark属性,包括executorConf,fetcher,driver,  config,props等
+3,创建sparkenv
+4,注册 CoarseGrainedExecutorBackend 到rpcEnv中
+5,注册 WorkerWatcher 到 rpcEnv中
+
+调用onStart方法;
+override def onStart() {
+  logInfo("Connecting to driver: " + driverUrl)
+  rpcEnv.asyncSetupEndpointRefByURI(driverUrl).flatMap { ref =>
+    // This is a very fast action so we can use "ThreadUtils.sameThread"
+    driver = Some(ref)
+    ref.ask[Boolean](RegisterExecutor(executorId, self, hostname, cores, extractLogUrls))
+  }(ThreadUtils.sameThread).onComplete {
+    // This is a very fast action so we can use "ThreadUtils.sameThread"
+    case Success(msg) =>
+      // Always receive `true`. Just ignore it
+    case Failure(e) =>
+      exitExecutor(1, s"Cannot register with driver: $driverUrl", e, notifyDriver = false)
+  }(ThreadUtils.sameThread)
+}
+发送registeredexecutor消息
+1,发送registeredexecutor消息,收到后,创建executor
