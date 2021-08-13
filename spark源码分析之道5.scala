@@ -501,3 +501,21 @@ case LaunchTask(data) =>
     executor.launchTask(this, taskDesc)
   }
 反序列化,然后launchtask
+
+
+总结local-cluster模式的任务执行过程:
+partition数量为n,会启动n个 CoarseGrainedExecutorBackend进程, n个 ShuffleMapTask, 分别分配到n个进程中执行
+
+local-cluster 和local模式的执行任务过程很类似;区别是 local-cluster模式的每个worker会启动多个 CoarseGrainedExecutorBackend进程; ExecutorBackend 和Executor 都再
+CoarseGrainedExecutorBackend 的JVM进程中.
+
+6.3 Standalone部署模式
+
+local模式只有 Driver 和Executor,在同一个JVM进程中;local-cluster模式的Driver,Master,Worker,也在同一个JVM中.所以local模式和local-cluster模式便于开发,但是生产环境中不适合.
+
+Standalone模式的特点:
+Driver在集群外,可以是任意的客户端应用程序(用来控制?)
+Master部署在单独的进程中,甚至应该在单独的机器节点.Master有多个,但是最多只有1个处于激活状态.
+Worker部署在单独的进程中
+
+6.3.1 启动Standalone模式
