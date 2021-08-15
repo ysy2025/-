@@ -519,3 +519,233 @@ Master部署在单独的进程中,甚至应该在单独的机器节点.Master有
 Worker部署在单独的进程中
 
 6.3.1 启动Standalone模式
+启动Standalone模式,需要保证,先启动Master,再逐个启动Worker.
+
+master 默认端口是7077,webui的端口是8080
+jps查看Master进程的信息
+启动完master,启动Worker;启动worker需要制定master的连接地址.
+
+启动信息可以看出,worker创建并秦东了actorsystem;workerui的端口为8081,最后向master注册worker等信息
+jps查看worker进程信息
+
+6.3.2 启动master分析:
+scala允许object中定义main函数作为应用的启动入口.
+
+actorSystem是老版本,新版本都是 rpcEnv
+
+private[deploy] object Master extends Logging {
+  val SYSTEM_NAME = "sparkMaster"
+  val ENDPOINT_NAME = "Master"
+
+  def main(argStrings: Array[String]) {
+    Utils.initDaemon(log)
+    val conf = new SparkConf
+    val args = new MasterArguments(argStrings, conf)
+    val (rpcEnv, _, _) = startRpcEnvAndEndpoint(args.host, args.port, args.webUiPort, conf)
+    rpcEnv.awaitTermination()
+  }
+  ...
+}
+
+1,Master参数解析;MasterArguments;
+MasterArguments 用于解析系统环境变量和启动Master时指定的命令行参数
+private[master] class MasterArguments(args: Array[String], conf: SparkConf) extends Logging {
+  var host = Utils.localHostName()
+  var port = 7077
+  var webUiPort = 8080
+  var propertiesFile: String = null
+
+  // Check for settings in environment variables
+  if (System.getenv("SPARK_MASTER_IP") != null) {
+    logWarning("SPARK_MASTER_IP is deprecated, please use SPARK_MASTER_HOST")
+    host = System.getenv("SPARK_MASTER_IP")
+  }
+
+  if (System.getenv("SPARK_MASTER_HOST") != null) {
+    host = System.getenv("SPARK_MASTER_HOST")
+  }
+  if (System.getenv("SPARK_MASTER_PORT") != null) {
+    port = System.getenv("SPARK_MASTER_PORT").toInt
+  }
+  if (System.getenv("SPARK_MASTER_WEBUI_PORT") != null) {
+    webUiPort = System.getenv("SPARK_MASTER_WEBUI_PORT").toInt
+  }
+
+  parse(args.toList)
+...
+}
+参数解析:
+host:master的监听地址;
+port:监听端口;
+webuiport:webui的监听端口;
+properitiesFile:spark属性文件;
+spark-master-host -host,-h
+spark-master-port port或者-p
+spark-master-webui-port -webui-port; -properties-file
+
+解析命令行参数:
+parse函数,命令行参数的值会覆盖系统环境变量的值
+--ip,-i,指定hostname
+--host,-h,指定hostname
+--port,-p,指定端口
+--webui-port,指定webui的端口
+--properties-file,spark系统属性文件
+--help,帮助
+
+private def parse(args: List[String]): Unit = args match {
+  case ("--ip" | "-i") :: value :: tail =>
+    Utils.checkHost(value, "ip no longer supported, please use hostname " + value)
+    host = value
+    parse(tail)
+  case ("--host" | "-h") :: value :: tail =>
+    Utils.checkHost(value, "Please use hostname " + value)
+    host = value
+    parse(tail)
+  case ("--port" | "-p") :: IntParam(value) :: tail =>
+    port = value
+    parse(tail)
+  case "--webui-port" :: IntParam(value) :: tail =>
+    webUiPort = value
+    parse(tail)
+  case ("--properties-file") :: value :: tail =>
+    propertiesFile = value
+    parse(tail)
+  case ("--help") :: tail =>
+    printUsageAndExit(0)
+  case Nil => // No-op
+  case _ =>
+    printUsageAndExit(1)
+}
+系统变量中如果指定了 spark.master.ui.port,会覆盖环境变量
+创建,启动 rpcEnv, 然后注册 Master
+
+6.3.3 启动Worker分析
+Worker也通过Main函数启动
+
+创建sparkconf
+创建worker的参数
+创建启动 rpcenv,注册worker
+
+参数解析:大同小异
+host:监听地址
+port:监听端口
+webUiPort:webui监听端口
+propertiesFile:spark属性文件
+cores:内核数
+memory:内存大小
+masters:地址列表
+workdir:工作目录
+spark-worker-port:端口
+spark-worker-webui-port:port
+spark-worker-cores:内核
+spark-worker-memory:内存
+spark-worker-dir:目录
+
+workerarguments的parse函数和master的parse函数类似
+
+6.3.4 启动Driver Application分析
+local-cluster模式和standalone模式很相似;
+local-cluster模式是真正的分布式部署;所有master和worker都位于独立的jvm进程甚至是不同的机器节点上
+standalone模式下,可以存在多个master;这些master之间通过持久化引擎和领导选举机制,解决生成环境下,
+master的单点问题;使得master在异常退出后,能重新选举激活master
+
+standalone模式下,可以存在多个master;这些master之间通过持久化引擎和领导选举机制,解决生成环境下,master的单点问题
+master异常退出后能够重新选举激活状态的master,并从故障中恢复集群
+
+6.3.5 standalone模式的任务执行
+
+6.3.6 资源回收
+任务完成后,application的资源如何回收?
+
+1,打招呼;2,不辞而别
+1,打招呼.
+stop方法用于关闭清理服务和回收资源.
+SparkContext.scala中有实现方式
+
+DAGScheduler的stop方法,涉及资源回收
+def stop() {
+  messageScheduler.shutdownNow()
+  eventProcessLoop.stop()
+  taskScheduler.stop()
+}
+
+TaskSchedulerImpl,stop方法,如下
+override def stop() {
+  speculationScheduler.shutdown()
+  if (backend != null) {
+    backend.stop()
+  }
+  if (taskResultGetter != null) {
+    taskResultGetter.stop()
+  }
+  starvationTimer.cancel()
+}
+
+CoarseGrainedSchedulerBackend的stop方法,调用了stopExecutors方法,停止executor
+
+向driverendpoint发送stopexecutors消息,driverendpoint收到消息后:
+case StopDriver =>
+  context.reply(true)
+  stop()
+case StopExecutors =>
+  logInfo("Asking each executor to shut down")
+  for ((_, executorData) <- executorDataMap) {
+    executorData.executorEndpoint.send(StopExecutor)
+  }
+  context.reply(true)
+
+处理stopexecutor消息时,调用了executor的stop方法关闭线程,停止sparkenv
+
+2,不辞而别;直接跑路,application只记得跟executor打声招呼,却忘记了master;
+akka的通信机制,确保相互通信的任意一方,异常退出,另外一个都会收到disasscoatedevent.master是在处理disassociatedevent消息时,
+移除已经停止的driverapplication;
+
+case DisassociatedEvent 的代码,现在是 onDisconnected;
+override def onDisconnected(address: RpcAddress): Unit = {
+  // The disconnected client could've been either a worker or an app; remove whichever it was
+  logInfo(s"$address got disassociated, removing it.")
+  addressToWorker.get(address).foreach(removeWorker)
+  addressToApp.get(address).foreach(finishApplication)
+  if (state == RecoveryState.RECOVERING && canCompleteRecovery) { completeRecovery() }
+}
+
+如果编写任务时,忘记调用SparkContext的stop方法,Executor的资源虽然不会被主动收回,但是由于 coarsegrainedexecutorbackend 也会收到
+disconnected消息,直接退出 CoarseGrainedExecutorBackend进程
+
+6.4 容错机制
+分布式系统中,机器数量众多,需要融创
+
+6.4.1 Executor异常容错
+Worker收到 ExecutorStateChanged 消息后,向Master转发ExecutorStateChanged;
+Master收到 ExecutorStateChanged后
+1,找到占有Executor的application的applicationinfo,以及executor对应的executorinfo
+2,将executorinfo的状态,修改为exited
+3,exited也属于executor完成状态,所以会将executorinfo,从applicationinfo和workerinfo中移除
+4,由于executor非正常退出,所以重新调用schedule给application进行资源调度
+
+6.4.2 worker异常退出
+worker进程退出时,shutdownhook线程,调用killprocess,杀死 coarsegrainedexecutorbackend, 然后收到进程返回的退出状态, 向worker发送 ExecutorStateChanged
+worker退出,no heartbeat, 无法更新master最后一次接受心跳的时间戳;
+removeworker,删除长期失联的worker;将此worker所有executor用lost同步更新到driver application
+master会为workerinfo服务的driver application 重新调度,分配到其他worker上
+
+6.4.3 master异常退出
+if只有1个master,并且退出时:
+1,if executor上任务执行完毕,需要对资源回收->driver application会回收管理的executor的资源;没有影响;
+如果不辞而别,master无法收到失联消息,但是 coarsegrainedexecutorbackend 仍然可以收到 失联消息,退出进程
+所以,master退出,如果worker,executor正常运行,对于资源回收没关系
+2,如果master异常退出+executor异常退出->worker无法通过 executorstatechagned消息,促使master重新给driver
+调度运行executor;driver提交的任务无法执行, executor占用的资源无法退出
+3,如果worker也异常退出,那么worker+executor都停止服务;此时由于无法通知master,让driver调度到其他worker,driver提交的任务gg
+worker虽然kill了executor,但是worker资源无法被driver重新调度
+4,新的drier需要提交任务,则无法成功
+
+只有一个master,单点故障.
+master/slave架构,多个master,1个负责整个集群的调度,资源管理;
+
+持久化引擎/领导选举agent
+
+spark目前,提供的,故障恢复的,持久化引擎
+zookeeper persistence engine;
+filesystem persistence engine;
+blackhole persistence engine;默认的持久化引擎,不提供故障恢复的持久化能力
