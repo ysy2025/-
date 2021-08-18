@@ -152,4 +152,16 @@ abstract class RDD
 		给定flag,readCachedBlock,是否读取缓存的块
 		调用 SparkEnv.get.blockManager.getOrElseUpdate,确定是get还是update
 			如果是Left
+				如果读取了缓存的块:
+					获取存在的metrics;
+					读取blockresult的bytes
+					初始化新的 InterruptibleIterator,迭代器;
+						定义next方法,读取1个record,然后delegate移动到下一个
+				如果还没有读取缓存的块:
+					始化新的 InterruptibleIterator,迭代器;但是返回类型和前面提到的不一样
 			如果是Right
+				初始化新的 InterruptibleIterator,参数不同,返回类型不同
+
+	定义 withScope方法:
+		U = RDDOperationScope.withScope[U](sc)(body)
+		调用 RDDOperationScope 类的withScope方法

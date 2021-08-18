@@ -749,3 +749,82 @@ spark目前,提供的,故障恢复的,持久化引擎
 zookeeper persistence engine;
 filesystem persistence engine;
 blackhole persistence engine;默认的持久化引擎,不提供故障恢复的持久化能力
+领导选举机制,可以保证集群虽然存在多个master,但是只有一个master处于active状态;其他全部都是standby
+
+当active状态的master出现故障,选举一个standby的master作为新的active的master
+
+整个集群的worker,driver,application的信息都已经持久化到文件系统,因此切换时智慧影响新任务的提交,对正在运行的任务没有影响
+
+spark目前的领导选举,两种:
+ZookeeperLeaderElectionAgent,对于zookeeper,提供的选举机制的代理
+MonarchyLeaderAgent,默认的选举机制代理
+
+默认下,spark不提供故障恢复;
+
+如果不设置, spark.deploy.recoveryDirectory和spark.deploy.recoveryMode时,recovery_mode等于None,此时应该使用的持久化引擎,是BlackHolePersistenceEngine,虽然继承了PersistenceEngine,但是实现方法是空的.
+
+如果不设置 spark.deploy.recoveryDirectory, spark.deploy.recoveryMode,选举切换之后,新的master会丢失集群之前的所有信息
+
+FileSystemPersistenceEngine,搭配MonarchyLeaderAgent,实现故障恢复
+if想用spark本身实现选举和故障恢复,可以设置spark.deploy.recoveryMode=FileSystem
+FileSystemPersistenceEngine 最重要的方法是 serializeIntoFile,deserializeFromFile
+serializeIntoFile可以将任何AnyRef序列化写入文件;
+deserializeFromFile,可以将任何FIleInputStream反序列化为任何对象
+
+当 spark.deploy.recoveryMode=FileSystem,领导选举代理=MonarchyLeaderAgent
+此时,选举会从FileSystemPersistenceEngine,读取持久化集群信息,然后调用beginRecovery方法,恢复集群
+最后设置一个向Master自身发送CompleteRecovery消息的定时调度
+
+beginRecovery的实现如下:
+将读取的集群信息中的ApplicationInfo重新调用,registerApplication,方法注册
+将读取的集群信息中的DriverInfo重新添加到缓存drivers
+将读取的集群信息中的WorkerInfo重新调用registerWorker方法注册
+
+Master收到completerecovery消息后,匹配执行 completerecovery方法
+
+completeRecovery方法,用于恢复集群信息
+1,通过同步保证对于集群,恢复只恢复1次
+2,将所有没有响应的application通过调用finishApplication方法清除
+3,将所有没有被调度的Driver重新调度
+
+
+2,使用Zookeeper提供的选举和持久化
+recoveryMode=zookeeper时,匹配的持久化引擎是zookeeperpersistenceengine,实现了persistenceengine接口
+
+此时,选举领导代理是 zookeeperleaderelectionagent;
+
+
+6.5 其他部署方案
+spark再第三方资源管理集群上的部署方案
+yarn,mesos等
+
+6.5.1 yarn
+yarn=resourcemanager+applicationmanager;rm负责资源管理和调度,am负责应用程序的任务划分+调度
+
+yarn对于支持的mapreduce框架是可插拔的.spark对于集群管理器也支持可插拔
+
+yarn+spark时,spark的启动顺序如下
+1,spark提供的applicationmaster再yarn中启动
+2,applicationmaster向resourcemanager申请container
+3,申请container后,向具体的nodemanager发送指令,启动container
+4,applicationmaster启动对于各个运行的containerexecutor进行监控
+
+ApplicationMaster.scala中的main函数可以看出一二
+
+applicationMaster会调用构造时传入的 YarnRMClientImpl的register方法,向yarn注册am
+可以参考 YarnRMClient.scala中的 register方法
+
+设置master=yarn-cluster,那么创建 taskschedulerimpl时,会匹配yarn-cluster模式
+其中yarnclusterscheduler继承自taskschedulerimpl,因此,yarnclusterscheduler将负责任务的提交和调度
+yarnschedulerbackend,继承自 spark.scheduler.cluster的 CoarseGrainedExecutorBackend
+YarnClusterSchedulerBackend继承了YarnSchedulerBackend
+于是,YarnClusterSchedulerBackend就是TaskSchedulerImpl的backend
+
+driverapplication 初始化完毕后,会向ApplicationMaster进行注册,在yarn部署模式中,worker被nodemanager替代,applicationmaster给application分配资源.借助yarnallocationhandler
+
+6.5.2 mesos
+Mesos是一个集群管理器
+
+
+6.6 小结:
+local->local-cluster->standalone
