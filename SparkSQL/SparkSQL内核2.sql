@@ -45,3 +45,9 @@ http://icejoywoo.github.io/2019/01/16/intro-to-antlr4.html
 访问者模式是一种将算法与对象结构分离的软件设计模式
 
 4.2 SparkSqlParser之AstBuilder
+
+
+5 SparkSQL 逻辑计划
+在此阶段，字符串形态的 SQL 语句转换为树结构形态的逻辑算子树， SQL 中所包含的各种处理逻辑（过滤、剪裁等）和数据信息都会被整合在逻辑算子树的不同节点中
+
+Spark SQL 逻辑计划在实现层面被定义为 LogicalPlan 类 。 从 SQL 语句经过 SparkSqlParser解析生成 Unresolved LogicalPlan ，到最终优化成为 Optimized LogicalPlan
