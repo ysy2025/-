@@ -40,3 +40,8 @@ DSL模块涉及两个工作:
 1,设计语法和语义,定义DSL中的元素
 2,实现词法分析器Lexer,语法分析器Parser,完成DSL解析,转换为底层逻辑
 http://icejoywoo.github.io/2019/01/16/intro-to-antlr4.html
+
+4.1.2 访问者模式
+访问者模式是一种将算法与对象结构分离的软件设计模式
+
+4.2 SparkSqlParser之AstBuilder
